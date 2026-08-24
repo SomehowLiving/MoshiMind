@@ -19,6 +19,7 @@ from .task_registry import TaskRegistry, TaskHandle
 from .sidecar import CognitiveSidecar, CognitiveRequest, CognitiveResult, CognitiveService
 from .speculation import SpeculativeSlot
 from .predictive_trigger import PredictiveTrigger
+from .multishot import MultiShotGate
 
 __all__ = [
     "ConfidenceScore",
@@ -32,4 +33,5 @@ __all__ = [
     "CognitiveService",
     "SpeculativeSlot",
     "PredictiveTrigger",
+    "MultiShotGate",
 ]

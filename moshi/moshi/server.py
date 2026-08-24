@@ -105,6 +105,8 @@ class ServerState:
         device: str | torch.device | None = None,
         rag_timeout: float = 1.5,
         rag_min_conditioning_strength: float = 0.15,
+        rag_max_shots_per_turn: int = 3,
+        rag_shot_cooldown_seconds: float = 2.0,
         max_reference_tokens: int = 512,
         stt_wait_time: float = 0.5,
         gradium_stt: bool = False,
@@ -118,6 +120,8 @@ class ServerState:
         self.reference_encoder_url = reference_encoder_url
         self.rag_timeout = rag_timeout
         self.rag_min_conditioning_strength = rag_min_conditioning_strength
+        self.rag_max_shots_per_turn = rag_max_shots_per_turn
+        self.rag_shot_cooldown_seconds = rag_shot_cooldown_seconds
         self.metrics = Metrics()
         self.max_reference_tokens = max_reference_tokens
         self.vad_window_size = vad_window_size
@@ -352,6 +356,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--rag-max-shots-per-turn",
+        type=int,
+        default=3,
+        help="Maximum number of confirmed RAG triggers honored within one model response (default: 3).",
+    )
+    parser.add_argument(
+        "--rag-shot-cooldown-seconds",
+        type=float,
+        default=2.0,
+        help="Minimum time between confirmed RAG triggers within one model response (default: 2.0).",
+    )
+    parser.add_argument(
         "--max-reference-tokens",
         type=int,
         default=512,
@@ -439,6 +455,8 @@ def main():
         device=args.device,
         rag_timeout=args.rag_timeout,
         rag_min_conditioning_strength=args.rag_min_conditioning_strength,
+        rag_max_shots_per_turn=args.rag_max_shots_per_turn,
+        rag_shot_cooldown_seconds=args.rag_shot_cooldown_seconds,
         max_reference_tokens=args.max_reference_tokens,
         batch_size=args.batch_size,
         vad_window_size=args.vad_window_size,

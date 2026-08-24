@@ -20,6 +20,7 @@ from moshi.cognitive import (
     CognitiveResult,
     CognitiveSidecar,
     ConfidenceScore,
+    MultiShotGate,
     PredictiveTrigger,
     SpeculativeSlot,
     TaskRegistry,
@@ -503,3 +504,51 @@ def test_speculative_slot_cancel_and_clear_awaits_cancellation():
             assert slot.has_attempt() is False
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# MultiShotGate (per-response retrieval budget)
+# ---------------------------------------------------------------------------
+
+
+def test_multishot_gate_allows_first_shot():
+    gate = MultiShotGate(max_shots_per_turn=3, min_cooldown_seconds=2.0)
+    assert gate.should_allow(now=0.0) is True
+
+
+def test_multishot_gate_enforces_cooldown():
+    gate = MultiShotGate(max_shots_per_turn=3, min_cooldown_seconds=2.0)
+    gate.record_shot(now=10.0)
+    assert gate.should_allow(now=11.0) is False  # only 1s later, cooldown is 2s
+    assert gate.should_allow(now=12.0) is True  # exactly at the cooldown boundary
+
+
+def test_multishot_gate_enforces_max_shots_per_turn():
+    gate = MultiShotGate(max_shots_per_turn=2, min_cooldown_seconds=0.0)
+    gate.record_shot(now=0.0)
+    gate.record_shot(now=1.0)
+    assert gate.shots_this_turn == 2
+    assert gate.should_allow(now=100.0) is False  # cap hit, cooldown irrelevant
+
+
+def test_multishot_gate_reset_clears_budget_and_cooldown():
+    gate = MultiShotGate(max_shots_per_turn=1, min_cooldown_seconds=5.0)
+    gate.record_shot(now=0.0)
+    assert gate.should_allow(now=1.0) is False
+
+    gate.reset()
+
+    assert gate.should_allow(now=1.0) is True
+    assert gate.shots_this_turn == 0
+
+
+def test_multishot_gate_default_allows_a_few_spaced_out_shots():
+    gate = MultiShotGate()  # defaults: 3 shots, 2s cooldown
+    t = 0.0
+    allowed = 0
+    for _ in range(5):
+        if gate.should_allow(now=t):
+            gate.record_shot(now=t)
+            allowed += 1
+        t += 3.0  # comfortably past the default cooldown each time
+    assert allowed == 3  # capped by max_shots_per_turn even though cooldown was always satisfied

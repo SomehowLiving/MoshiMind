@@ -38,6 +38,7 @@ from aiohttp import web
 from .audio_processor import AudioProcessor
 from .rag_manager import RAGManager
 from ..cognitive.confidence import ConfidenceScore
+from ..cognitive.multishot import MultiShotGate
 from ..cognitive.predictive_trigger import PredictiveTrigger
 from .turn_manager import TurnManager
 from .utils import get_conditioning_remote_async
@@ -126,6 +127,13 @@ class Channel:
         # the partial ASR transcript of the user's current turn.
         self.predictive_trigger = PredictiveTrigger()
         self._current_user_utterance: str = ""
+        # Bounds confirmed rag_token_id triggers per model response (Phase 1.3):
+        # repeated triggers in quick succession are as likely to be looping/uncertainty
+        # as N genuinely distinct information needs.
+        self.multishot_gate = MultiShotGate(
+            max_shots_per_turn=server.rag_max_shots_per_turn,
+            min_cooldown_seconds=server.rag_shot_cooldown_seconds,
+        )
 
     async def __aenter__(self) -> "Channel":
         self._stack = contextlib.AsyncExitStack()
@@ -440,19 +448,32 @@ class Channel:
 
             # Text / RAG triggers.
             if text_token == self.server.runner.lm_gen.lm_model.rag_token_id:
-                self._log.info("[RAG] model emitted RAG token, triggering reference generation")
-                assert self._task_group is not None
-                await self._send_turn_outputs([("[RET]", "model")])
-                await self.stt.flush()
-                self.server.metrics.increment("rag_triggers_total")
-                await self.rag_manager.trigger(
-                    task_group=self._task_group,
-                    wait_steps=self.server.stt_wait_steps,
-                    handle_reference_fn=self._bind_reference_handler(),
-                    context_provider=self.turn_manager.get_context,
-                )
+                now = time.time()
+                if not self.multishot_gate.should_allow(now):
+                    self._log.info(
+                        f"[RAG] model emitted RAG token but multi-shot gate declined "
+                        f"(shots_this_turn={self.multishot_gate.shots_this_turn}); continuing on existing conditioning"
+                    )
+                    self.server.metrics.increment("rag_multishot_declined_total")
+                else:
+                    self._log.info("[RAG] model emitted RAG token, triggering reference generation")
+                    assert self._task_group is not None
+                    await self._send_turn_outputs([("[RET]", "model")])
+                    await self.stt.flush()
+                    self.multishot_gate.record_shot(now)
+                    self.server.metrics.increment("rag_triggers_total")
+                    await self.rag_manager.trigger(
+                        task_group=self._task_group,
+                        wait_steps=self.server.stt_wait_steps,
+                        handle_reference_fn=self._bind_reference_handler(),
+                        context_provider=self.turn_manager.get_context,
+                    )
             else:
                 decoded = self._decode_text_token(text_token)
-                await self._send_turn_outputs(self.turn_manager.handle_spoken_text(model_text=decoded))
+                outputs = self.turn_manager.handle_spoken_text(model_text=decoded)
+                if any(role == "model" and text.startswith("\n") for text, role in outputs):
+                    # A new model response is starting: reset the per-response shot budget.
+                    self.multishot_gate.reset()
+                await self._send_turn_outputs(outputs)
 
             self.rag_manager.step()
