@@ -25,6 +25,7 @@ from .channel import StepInput, StepOutput
 from .rag_manager import RAGManager
 from .turn_manager import TurnManager
 from .utils import get_conditioning_remote_async
+from ..cognitive.confidence import ConfidenceScore
 from ..stt import LocalSpeechToText, STTWordMessage
 from ..server import ServerState
 
@@ -106,6 +107,7 @@ class InferenceJob:
         self.step_index = 0
         self.model_text: list[str] = []
         self.user_text: list[str] = []
+        self._pending_confidence: ConfidenceScore | None = None
 
         self.trace: dict[str, Any] = {
             "rag_trigger_step": -1,
@@ -154,25 +156,41 @@ class InferenceJob:
                 consecutive = 0
         return False
 
-    async def _async_update_reference(self, reference_text: str) -> None:
+    async def _async_update_reference(
+        self, reference_text: str, confidence: ConfidenceScore | None = None
+    ) -> None:
+        confidence = confidence if confidence is not None else ConfidenceScore()
+        strength = confidence.strength()
+        if strength < self.server.rag_min_conditioning_strength:
+            self.trace["conditioning_skipped_low_confidence"] = strength
+            return
         streaming_sum_tensor = await get_conditioning_remote_async(
             text=reference_text,
             encoder_url=self.server.reference_encoder_url,
         )
+        if strength < 1.0:
+            streaming_sum_tensor = streaming_sum_tensor * strength
         batch_size = self.server.batch_size
         per_slot: list[torch.Tensor | None] = [None] * batch_size
         per_slot[self.slot_idx] = streaming_sum_tensor.squeeze(0)
         self.server.runner.lm_gen.update_streaming_sum_tensors(per_slot)
         self.trace["conditioning_step"] = self.step_index
+        self.trace["conditioning_strength"] = strength
 
-    async def _handle_reference_text(self, reference_text: str | None, lm_label: str = "") -> None:
-        await self._async_update_reference(reference_text or "")
+    async def _handle_reference_text(
+        self, reference_text: str | None, lm_label: str = "", confidence: ConfidenceScore | None = None
+    ) -> None:
+        await self._async_update_reference(reference_text or "", confidence)
         self._retrieval_start_time = None
         self._retrieval_start_step = None
         self._retrieval_done_step = None
 
-    async def _catch_reference_text(self, reference_text: str | None, lm_label: str = "") -> None:
+    async def _catch_reference_text(
+        self, reference_text: str | None, lm_label: str = "", confidence: ConfidenceScore | None = None
+    ) -> None:
         self.trace["reference_text"] = reference_text or ""
+        self._pending_confidence = confidence or ConfidenceScore()
+        self.trace["reference_confidence"] = self._pending_confidence.strength()
         assert self._retrieval_start_time is not None
         retrieval_elapsed = max(0.0, time.monotonic() - self._retrieval_start_time)
 
@@ -313,7 +331,7 @@ class InferenceJob:
                 self._retrieval_start_time = time.monotonic()
                 self._doing_retrieval = True
             if self._retrieval_done_step is not None and self.step_index >= self._retrieval_done_step:
-                await self._handle_reference_text(self.trace["reference_text"])
+                await self._handle_reference_text(self.trace["reference_text"], confidence=self._pending_confidence)
 
             async with self._pcm_one_step_cv:
                 self.step_index += 1

@@ -37,6 +37,7 @@ from aiohttp import web
 
 from .audio_processor import AudioProcessor
 from .rag_manager import RAGManager
+from ..cognitive.confidence import ConfidenceScore
 from .turn_manager import TurnManager
 from .utils import get_conditioning_remote_async
 from ..stt import GradiumSpeechToText, LocalSpeechToText, STTWordMessage
@@ -164,7 +165,11 @@ class Channel:
     # ------------------------------------------------------------------
 
     async def _handle_reference_text(
-        self, reference_text: str | None, lm_label: str = "", trigger_seq: int | None = None
+        self,
+        reference_text: str | None,
+        lm_label: str = "",
+        trigger_seq: int | None = None,
+        confidence: ConfidenceScore | None = None,
     ):
         """Forward a freshly generated reference text to the UI and the LM.
 
@@ -173,6 +178,9 @@ class Channel:
             lm_label: Display name of the LLM used for reference generation (sent to client UI).
             trigger_seq: The ``_rag_seq`` value captured when this retrieval was triggered; used
                 to drop the ARC encoding if a newer trigger has since superseded it.
+            confidence: How much to trust this reference (see ``cognitive.confidence``); scales
+                the conditioning bias strength instead of applying it at fixed strength whenever
+                retrieval merely succeeded.
         """
         if reference_text is None:
             preview, ref_len = "", 0
@@ -189,9 +197,25 @@ class Channel:
 
         self._log.info("[Reference] requesting ARC encoding for new reference")
         assert self._task_group is not None, "Channel.run() must be active"
-        self._task_group.create_task(self._async_update_reference(reference_text or "", trigger_seq))
+        self._task_group.create_task(
+            self._async_update_reference(reference_text or "", trigger_seq, confidence)
+        )
 
-    async def _async_update_reference(self, reference_text: str, trigger_seq: int | None = None):
+    async def _async_update_reference(
+        self, reference_text: str, trigger_seq: int | None = None, confidence: ConfidenceScore | None = None
+    ):
+        confidence = confidence if confidence is not None else ConfidenceScore()
+        strength = confidence.strength()
+        min_strength = self.server.rag_min_conditioning_strength
+        if strength < min_strength:
+            self._log.info(
+                f"[Reference] skipping ARC encoding: conditioning strength {strength:.2f} "
+                f"below floor {min_strength:.2f} (relevance={confidence.relevance:.2f}, "
+                f"confidence={confidence.confidence:.2f}, freshness={confidence.freshness:.2f})"
+            )
+            self.server.metrics.increment("rag_low_confidence_skipped_total")
+            return
+
         request_started = time.time()
         try:
             streaming_sum_tensor = await get_conditioning_remote_async(
@@ -210,7 +234,7 @@ class Channel:
         elapsed = time.time() - request_started
         self._log.info(
             f"[Reference] ARC encoding received in {elapsed:.3f}s "
-            f"(streaming_sum {tuple(streaming_sum_tensor.shape)})"
+            f"(streaming_sum {tuple(streaming_sum_tensor.shape)}, strength={strength:.2f})"
         )
         self.server.metrics.observe("rag_arc_encoder_latency_seconds", elapsed)
 
@@ -221,6 +245,11 @@ class Channel:
             )
             self.server.metrics.increment("rag_stale_reference_dropped_total")
             return
+
+        # Scale the conditioning bias by how much this reference should be trusted,
+        # instead of always applying it at full strength once retrieval merely succeeded.
+        if strength < 1.0:
+            streaming_sum_tensor = streaming_sum_tensor * strength
 
         # Build a per-slot update list: only this channel's slot gets the new tensor.
         batch_size = self.server.batch_size
@@ -380,8 +409,8 @@ class Channel:
                 trigger_seq = self._rag_seq
                 self.server.metrics.increment("rag_triggers_total")
 
-                async def _handle_reference_fn(reference_text, lm_label="", _seq=trigger_seq):
-                    await self._handle_reference_text(reference_text, lm_label, trigger_seq=_seq)
+                async def _handle_reference_fn(reference_text, lm_label="", confidence=None, _seq=trigger_seq):
+                    await self._handle_reference_text(reference_text, lm_label, trigger_seq=_seq, confidence=confidence)
 
                 await self.rag_manager.trigger(
                     task_group=self._task_group,

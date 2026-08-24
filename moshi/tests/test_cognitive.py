@@ -105,6 +105,39 @@ def test_confidence_clamps_out_of_range_inputs():
     assert score.freshness == 1.0
 
 
+def test_heuristic_confidence_empty_reference_is_zero_strength():
+    score = ConfidenceScore.heuristic_from_llm_reference("", elapsed_seconds=0.1, timeout_seconds=1.5)
+    assert score.strength() == 0.0
+
+
+def test_heuristic_confidence_whitespace_only_reference_is_zero_strength():
+    score = ConfidenceScore.heuristic_from_llm_reference("   \n\t  ", elapsed_seconds=0.1, timeout_seconds=1.5)
+    assert score.strength() == 0.0
+
+
+def test_heuristic_confidence_fast_answer_beats_rushed_answer():
+    fast = ConfidenceScore.heuristic_from_llm_reference(
+        "NVIDIA's CEO is Jensen Huang.", elapsed_seconds=0.1, timeout_seconds=1.5
+    )
+    rushed = ConfidenceScore.heuristic_from_llm_reference(
+        "NVIDIA's CEO is Jensen Huang.", elapsed_seconds=1.45, timeout_seconds=1.5
+    )
+    assert fast.strength() > rushed.strength()
+
+
+def test_heuristic_confidence_very_short_reference_is_penalized():
+    short = ConfidenceScore.heuristic_from_llm_reference("Yes.", elapsed_seconds=0.1, timeout_seconds=1.5)
+    long = ConfidenceScore.heuristic_from_llm_reference(
+        "Yes, that is correct according to the source.", elapsed_seconds=0.1, timeout_seconds=1.5
+    )
+    assert short.strength() < long.strength()
+
+
+def test_heuristic_confidence_zero_timeout_does_not_crash():
+    score = ConfidenceScore.heuristic_from_llm_reference("some answer text", elapsed_seconds=0.0, timeout_seconds=0.0)
+    assert 0.0 <= score.strength() <= 1.0
+
+
 def test_confidence_geometric_mean_penalizes_one_weak_axis_more_than_arithmetic_mean():
     # relevance perfect, confidence very low: should read as "mostly untrustworthy",
     # not average out to a comfortable ~0.6 the way (1.0+0.9+0.9)/3 would.

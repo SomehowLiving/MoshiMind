@@ -14,6 +14,7 @@ import contextlib
 import time
 from typing import Awaitable, Callable
 import logging
+from ..cognitive.confidence import ConfidenceScore
 from ..reference import LLMReferenceGenerator
 from ..reference.llm_reference_generator import ReferenceHistory
 
@@ -65,14 +66,14 @@ class RAGManager:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
 
-    async def get_reference_text(self, context: str) -> tuple[str, str, float, str]:
-        """Returns (query_context, reference_text, elapsed_seconds, lm_display_name)."""
+    async def get_reference_text(self, context: str) -> tuple[str, str, float, str, ConfidenceScore]:
+        """Returns (query_context, reference_text, elapsed_seconds, lm_display_name, confidence)."""
         try:
             logger.info("[Reference] Generating reference")
 
             if self.gt_reference_text is not None:
                 logger.info(f"[Reference] Using ground truth reference text: {self.gt_reference_text}")
-                return "", self.gt_reference_text, 0.0, "Ground truth"
+                return "", self.gt_reference_text, 0.0, "Ground truth", ConfidenceScore()
 
             retrieval_start_time = time.time()
             query, reference_text, num_turns, lm_label = await self.reference_generator.generate_reference_text(
@@ -85,22 +86,26 @@ class RAGManager:
             retrieval_elapsed = time.time() - retrieval_start_time
             if num_turns > 0 and reference_text:
                 self._history.append((num_turns, reference_text))
-            logger.info(
-                f"[Reference] Generated reference in {retrieval_elapsed:.3f}s: {reference_text}",
+            confidence = ConfidenceScore.heuristic_from_llm_reference(
+                reference_text, retrieval_elapsed, self.rag_timeout
             )
-            return query, reference_text, retrieval_elapsed, lm_label
+            logger.info(
+                f"[Reference] Generated reference in {retrieval_elapsed:.3f}s "
+                f"(strength={confidence.strength():.2f}): {reference_text}",
+            )
+            return query, reference_text, retrieval_elapsed, lm_label, confidence
         except asyncio.TimeoutError:
             logger.warning(
                 f"[Reference] Reference generation timed out after {self.rag_timeout}s, returning empty string"
             )
             if self.metrics is not None:
                 self.metrics.increment("rag_llm_timeouts_total")
-            return "", "", self.rag_timeout, ""
+            return "", "", self.rag_timeout, "", ConfidenceScore.empty()
         except Exception as e:
             logger.error(f"[Reference] Error generating reference: {e}, returning empty string")
             if self.metrics is not None:
                 self.metrics.increment("rag_llm_errors_total")
-            return "", "", self.rag_timeout, ""
+            return "", "", self.rag_timeout, "", ConfidenceScore.empty()
 
     def warmup(self):
         """Warmup reference generator."""
@@ -151,9 +156,9 @@ class RAGManager:
             logger.info(
                 f"[Reference] Triggering retrieval with context_len={len(context)} snippet='...{context[-200:]}'"
             )
-            _, reference_text, _, lm_label = await self.get_reference_text(context)
+            _, reference_text, _, lm_label, confidence = await self.get_reference_text(context)
             if handle_reference_fn is not None:
-                await handle_reference_fn(reference_text, lm_label)
+                await handle_reference_fn(reference_text, lm_label, confidence=confidence)
             logger.info("[Reference] Background reference generation task completed")
         except asyncio.CancelledError:
             logger.info("[Reference] Reference generation cancelled")

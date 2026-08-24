@@ -66,3 +66,32 @@ class ConfidenceScore:
     def empty(cls) -> "ConfidenceScore":
         """No usable candidate — conditioning strength is exactly 0."""
         return cls(relevance=0.0, confidence=0.0, freshness=0.0)
+
+    @classmethod
+    def heuristic_from_llm_reference(
+        cls, reference_text: str, elapsed_seconds: float, timeout_seconds: float
+    ) -> "ConfidenceScore":
+        """Rough score for a retrieval-LLM-generated reference, until a real relevance
+        model exists (see PHASES.md Phase 1.1). Two cheap, available-today signals:
+
+        - an empty/near-empty reference is almost certainly a non-answer or refusal
+        - an answer that took nearly the full timeout budget was rushed under time
+          pressure and is less trustworthy than one that came back quickly
+
+        This has no access to the query itself, so ``relevance`` is left at 1.0 —
+        a real implementation would compare embedding similarity between the query
+        and the reference. ``freshness`` is likewise left at 1.0: generic
+        OpenAI-compatible chat completions carry no source timestamp.
+        """
+        text = (reference_text or "").strip()
+        if not text:
+            return cls.empty()
+
+        length_confidence = 1.0 if len(text) >= 10 else len(text) / 10
+        if timeout_seconds > 0:
+            time_pressure = _clamp01(elapsed_seconds / timeout_seconds)
+        else:
+            time_pressure = 0.0
+        rushed_penalty = 1.0 - 0.3 * time_pressure
+
+        return cls(relevance=1.0, confidence=length_confidence * rushed_penalty, freshness=1.0)

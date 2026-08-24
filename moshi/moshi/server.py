@@ -104,6 +104,7 @@ class ServerState:
         reference_encoder_url: str,
         device: str | torch.device | None = None,
         rag_timeout: float = 1.5,
+        rag_min_conditioning_strength: float = 0.15,
         max_reference_tokens: int = 512,
         stt_wait_time: float = 0.5,
         gradium_stt: bool = False,
@@ -116,6 +117,7 @@ class ServerState:
         self.text_tokenizer = text_tokenizer
         self.reference_encoder_url = reference_encoder_url
         self.rag_timeout = rag_timeout
+        self.rag_min_conditioning_strength = rag_min_conditioning_strength
         self.metrics = Metrics()
         self.max_reference_tokens = max_reference_tokens
         self.vad_window_size = vad_window_size
@@ -341,6 +343,15 @@ def main():
         help="Timeout for reference text generation in seconds (default: 1.5)",
     )
     parser.add_argument(
+        "--rag-min-conditioning-strength",
+        type=float,
+        default=0.15,
+        help=(
+            "Skip applying a reference's conditioning bias if its confidence-weighted "
+            "strength (see moshi.cognitive.confidence) falls below this floor (default: 0.15)."
+        ),
+    )
+    parser.add_argument(
         "--max-reference-tokens",
         type=int,
         default=512,
@@ -427,6 +438,7 @@ def main():
         gradium_stt=args.gradium_stt,
         device=args.device,
         rag_timeout=args.rag_timeout,
+        rag_min_conditioning_strength=args.rag_min_conditioning_strength,
         max_reference_tokens=args.max_reference_tokens,
         batch_size=args.batch_size,
         vad_window_size=args.vad_window_size,

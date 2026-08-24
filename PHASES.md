@@ -44,7 +44,7 @@ text present or not"?
 
 | # | Task | Approach | Files |
 |---|---|---|---|
-| 1.1 | Confidence-aware conditioning strength | Scale the `streaming_sum` tensor by `f(relevance, confidence, freshness)` before injection, instead of injecting at fixed strength whenever retrieval succeeds | `cognitive/confidence.py`, `channel.py::_async_update_reference` |
+| 1.1 ✅🧪 | Confidence-aware conditioning strength | Scale the `streaming_sum` tensor by `f(relevance, confidence, freshness)` before injection, instead of injecting at fixed strength whenever retrieval succeeds | `cognitive/confidence.py`, `channel.py::_async_update_reference`, `inference_job.py` |
 | 1.2 | Predictive/speculative retrieval | Start a retrieval as soon as the transcript looks like it's heading toward a knowledge need (heuristic first: named entity / question-word detector on the streaming ASR transcript; embedding-similarity trigger later), racing it against the model's own `rag_token_id` emission — first one to a usable result wins, the other is cancelled via the task registry | `cognitive/predictive_trigger.py` (new), `turn_manager.py` |
 | 1.3 | Dynamic (multi-shot) conditioning | Today one reference → one conditioning tensor → whole response. Extend `RAGManager` to accept a follow-up retrieval mid-response (second `rag_token_id`, or the predictive trigger firing again) and push a second tensor through the *existing* per-slot streaming update path — the plumbing (`update_streaming_sum_tensors` accepts a fresh tensor per slot at any time) already supports this; what's missing is deciding *when* a second retrieval is worth the interruption | `rag_manager.py`, `cognitive/sidecar.py` |
 | 1.4 | Retrieval quality benchmark hook | Every retrieval logs `(query, reference_text, confidence, latency, applied: bool)` to a structured log the Phase 9 benchmark suite can replay | `cognitive/telemetry.py` |
@@ -53,6 +53,18 @@ text present or not"?
 tensor's norm tracks the confidence score. 1.2/1.3 need a running server + LLM +
 ARC encoder to validate against real conversations — **BLOCKED in this environment**,
 written and unit-tested against fakes, flagged for integration testing on GPU hardware.
+
+**1.1 status:** implemented. `RAGManager.get_reference_text` now scores every
+retrieval-LLM reference with `ConfidenceScore.heuristic_from_llm_reference` (empty
+answer → 0, rushed-under-timeout and very-short answers penalized) and threads it
+through `_handle_reference_text` → `_async_update_reference` in both `channel.py`
+(live server) and `inference_job.py` (offline batch eval). Below
+`--rag-min-conditioning-strength` (default 0.15) the ARC-encoder call is skipped
+entirely; otherwise the returned tensor is scaled by `strength()` before
+`update_streaming_sum_tensors`. The heuristic itself has no query access yet (no
+real relevance signal) — real embedding-similarity relevance scoring is the next
+increment, not this one. Tensor-scaling path is BLOCKED for execution here (no
+torch/GPU); the scoring function itself has 10 new unit tests.
 
 ---
 
