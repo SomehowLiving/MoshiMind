@@ -28,6 +28,7 @@ from .inference_utils.batch_runner import BatchInput, BatchRunner
 from .inference_utils.utils import get_reference_encoder_url, seed_all, setup_logging
 from .inference_utils.channel import Channel, StepOutput
 from .inference_utils.retrieval_profiles import default_profile_id, load_retrieval_env
+from .cognitive.telemetry import RetrievalTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,7 @@ class ServerState:
         self.rag_max_shots_per_turn = rag_max_shots_per_turn
         self.rag_shot_cooldown_seconds = rag_shot_cooldown_seconds
         self.metrics = Metrics()
+        self.retrieval_telemetry = RetrievalTelemetry()
         self.max_reference_tokens = max_reference_tokens
         self.vad_window_size = vad_window_size
         self.vad_threshold = vad_threshold
@@ -480,6 +482,13 @@ def main():
         return web.json_response(state.metrics.snapshot())
 
     app.router.add_get("/api/metrics", handle_metrics)
+
+    async def handle_retrieval_telemetry(_: web.Request) -> web.Response:
+        """GET /api/retrieval_telemetry: structured per-retrieval log (PHASES.md 1.4),
+        for the Phase 9 benchmark suite to replay."""
+        return web.json_response(state.retrieval_telemetry.snapshot())
+
+    app.router.add_get("/api/retrieval_telemetry", handle_retrieval_telemetry)
 
     async def handle_session_feedback(request: web.Request) -> web.Response:
         """

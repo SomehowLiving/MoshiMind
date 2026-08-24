@@ -36,12 +36,14 @@ class RAGManager:
         max_tokens: int = 512,
         gt_reference_text: str | None = None,
         metrics=None,
+        telemetry=None,
     ):
         self.reference_generator = reference_generator
         self.rag_timeout = rag_timeout
         self.max_tokens = max_tokens
         self.gt_reference_text = gt_reference_text
         self.metrics = metrics
+        self.telemetry = telemetry
         self._history: ReferenceHistory = []
         self._wait_steps_remaining: int = 0
         self._wait_event: asyncio.Event | None = None
@@ -73,13 +75,21 @@ class RAGManager:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
 
-    async def get_reference_text(self, context: str) -> tuple[str, str, float, str, ConfidenceScore]:
-        """Returns (query_context, reference_text, elapsed_seconds, lm_display_name, confidence)."""
+    async def get_reference_text(
+        self, context: str, kind: str = "confirmed"
+    ) -> tuple[str, str, float, str, ConfidenceScore]:
+        """Returns (query_context, reference_text, elapsed_seconds, lm_display_name, confidence).
+
+        ``kind`` is "confirmed" (triggered by rag_token_id) or "speculative"
+        (``PredictiveTrigger``) — recorded in telemetry only, doesn't affect behavior.
+        """
         try:
             logger.info("[Reference] Generating reference")
 
             if self.gt_reference_text is not None:
                 logger.info(f"[Reference] Using ground truth reference text: {self.gt_reference_text}")
+                if self.telemetry is not None:
+                    self.telemetry.record(context, self.gt_reference_text, 1.0, 0.0, kind=kind)
                 return "", self.gt_reference_text, 0.0, "Ground truth", ConfidenceScore()
 
             retrieval_start_time = time.time()
@@ -100,6 +110,8 @@ class RAGManager:
                 f"[Reference] Generated reference in {retrieval_elapsed:.3f}s "
                 f"(strength={confidence.strength():.2f}): {reference_text}",
             )
+            if self.telemetry is not None:
+                self.telemetry.record(query, reference_text, confidence.strength(), retrieval_elapsed, kind=kind)
             return query, reference_text, retrieval_elapsed, lm_label, confidence
         except asyncio.TimeoutError:
             logger.warning(
@@ -107,11 +119,15 @@ class RAGManager:
             )
             if self.metrics is not None:
                 self.metrics.increment("rag_llm_timeouts_total")
+            if self.telemetry is not None:
+                self.telemetry.record(context, "", 0.0, self.rag_timeout, kind=kind)
             return "", "", self.rag_timeout, "", ConfidenceScore.empty()
         except Exception as e:
             logger.error(f"[Reference] Error generating reference: {e}, returning empty string")
             if self.metrics is not None:
                 self.metrics.increment("rag_llm_errors_total")
+            if self.telemetry is not None:
+                self.telemetry.record(context, "", 0.0, self.rag_timeout, kind=kind)
             return "", "", self.rag_timeout, "", ConfidenceScore.empty()
 
     def warmup(self):
@@ -213,7 +229,7 @@ class RAGManager:
 
         async def _run():
             context = context_provider() if context_provider is not None else ""
-            _, reference_text, _, lm_label, confidence = await self.get_reference_text(context)
+            _, reference_text, _, lm_label, confidence = await self.get_reference_text(context, kind="speculative")
             if reference_text and handle_reference_fn is not None:
                 provisional = confidence.scaled(confidence_discount)
                 logger.info(

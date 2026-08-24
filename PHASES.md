@@ -47,7 +47,7 @@ text present or not"?
 | 1.1 ✅🧪 | Confidence-aware conditioning strength | Scale the `streaming_sum` tensor by `f(relevance, confidence, freshness)` before injection, instead of injecting at fixed strength whenever retrieval succeeds | `cognitive/confidence.py`, `channel.py::_async_update_reference`, `inference_job.py` |
 | 1.2 ✅🧪 | Predictive/speculative retrieval | Start a retrieval as soon as the transcript looks like it's heading toward a knowledge need (heuristic first: named entity / question-word detector on the streaming ASR transcript; embedding-similarity trigger later), racing it against the model's own `rag_token_id` emission — first one to a usable result wins, the other is cancelled via the task registry | `cognitive/predictive_trigger.py`, `cognitive/speculation.py`, `rag_manager.py`, `channel.py` |
 | 1.3 ✅🧪 | Dynamic (multi-shot) conditioning | Today one reference → one conditioning tensor → whole response. Extend `RAGManager` to accept a follow-up retrieval mid-response (second `rag_token_id`, or the predictive trigger firing again) and push a second tensor through the *existing* per-slot streaming update path — the plumbing (`update_streaming_sum_tensors` accepts a fresh tensor per slot at any time) already supports this; what's missing is deciding *when* a second retrieval is worth the interruption | `cognitive/multishot.py`, `channel.py` |
-| 1.4 | Retrieval quality benchmark hook | Every retrieval logs `(query, reference_text, confidence, latency, applied: bool)` to a structured log the Phase 9 benchmark suite can replay | `cognitive/telemetry.py` |
+| 1.4 ✅🧪 | Retrieval quality benchmark hook | Every retrieval logs `(query, reference_text, confidence, latency, applied: bool)` to a structured log the Phase 9 benchmark suite can replay | `cognitive/telemetry.py` |
 
 **Acceptance:** 1.1 is testable today with mocked tensors (no GPU) — assert the scaled
 tensor's norm tracks the confidence score. 1.2/1.3 need a running server + LLM +
@@ -102,6 +102,17 @@ speaker-switch marker already used to reset the Phase 1.2 predictive trigger.
 Deliberately scoped to the live server only, not `inference_job.py`'s offline
 batch eval path, where seeing every genuine shot is more useful than bounding
 cost. 5 new unit tests, all torch-free (45/45 total in `test_cognitive.py`).
+
+**1.4 status:** implemented, closing out Phase 1. `cognitive/telemetry.py::RetrievalTelemetry`
+is a bounded structured log; `RAGManager.get_reference_text` records one event per
+attempt (query, reference text, confidence, latency), tagged `kind="confirmed"` or
+`"speculative"` depending on which trigger called it. `applied` here means only
+"the retrieval step produced a usable candidate" — whether it actually ended up
+biasing generation is a separate, later decision already tracked by
+`rag_low_confidence_skipped_total`/`rag_stale_reference_dropped_total`; conflating
+the two would overclaim what this log proves. Exposed at `GET /api/retrieval_telemetry`
+alongside the existing `/api/metrics`. 7 new unit tests, all torch-free (52/52 total
+in `test_cognitive.py`). Phase 1 (native Moshi + RAG integration) is now complete.
 
 ---
 

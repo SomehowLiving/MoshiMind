@@ -98,6 +98,7 @@ class Channel:
             rag_timeout=server.rag_timeout,
             max_tokens=server.max_reference_tokens,
             metrics=server.metrics,
+            telemetry=server.retrieval_telemetry,
         )
         self.audio_processor = AudioProcessor(power_threshold=server.power_threshold)
 

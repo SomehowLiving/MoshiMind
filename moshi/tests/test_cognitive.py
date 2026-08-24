@@ -22,6 +22,7 @@ from moshi.cognitive import (
     ConfidenceScore,
     MultiShotGate,
     PredictiveTrigger,
+    RetrievalTelemetry,
     SpeculativeSlot,
     TaskRegistry,
     Urgency,
@@ -552,3 +553,62 @@ def test_multishot_gate_default_allows_a_few_spaced_out_shots():
             allowed += 1
         t += 3.0  # comfortably past the default cooldown each time
     assert allowed == 3  # capped by max_shots_per_turn even though cooldown was always satisfied
+
+
+# ---------------------------------------------------------------------------
+# RetrievalTelemetry (structured log for the Phase 9 benchmark suite)
+# ---------------------------------------------------------------------------
+
+
+def test_telemetry_records_a_successful_retrieval():
+    telemetry = RetrievalTelemetry()
+    event = telemetry.record("who is the CEO", "Jensen Huang", confidence=0.9, latency_seconds=0.3)
+    assert event.query == "who is the CEO"
+    assert event.reference_text == "Jensen Huang"
+    assert event.confidence == 0.9
+    assert event.latency_seconds == 0.3
+    assert event.applied is True
+    assert event.kind == "confirmed"
+
+
+def test_telemetry_marks_empty_reference_as_not_applied():
+    telemetry = RetrievalTelemetry()
+    event = telemetry.record("who is the CEO", "", confidence=0.0, latency_seconds=1.5)
+    assert event.applied is False
+
+
+def test_telemetry_marks_zero_confidence_as_not_applied_even_with_text():
+    telemetry = RetrievalTelemetry()
+    event = telemetry.record("query", "some text", confidence=0.0, latency_seconds=0.1)
+    assert event.applied is False
+
+
+def test_telemetry_tags_speculative_kind():
+    telemetry = RetrievalTelemetry()
+    event = telemetry.record("query", "text", confidence=0.5, latency_seconds=0.2, kind="speculative")
+    assert event.kind == "speculative"
+
+
+def test_telemetry_snapshot_returns_plain_dicts_in_order():
+    telemetry = RetrievalTelemetry()
+    telemetry.record("q1", "a1", 0.9, 0.1)
+    telemetry.record("q2", "a2", 0.8, 0.2)
+    snapshot = telemetry.snapshot()
+    assert [e["query"] for e in snapshot] == ["q1", "q2"]
+    assert all(isinstance(e, dict) for e in snapshot)
+
+
+def test_telemetry_bounds_history_to_max_events():
+    telemetry = RetrievalTelemetry(max_events=3)
+    for i in range(5):
+        telemetry.record(f"q{i}", f"a{i}", 1.0, 0.1)
+    snapshot = telemetry.snapshot()
+    assert len(snapshot) == 3
+    assert [e["query"] for e in snapshot] == ["q2", "q3", "q4"]  # oldest evicted first
+
+
+def test_telemetry_clear_empties_the_log():
+    telemetry = RetrievalTelemetry()
+    telemetry.record("q", "a", 1.0, 0.1)
+    telemetry.clear()
+    assert telemetry.snapshot() == []

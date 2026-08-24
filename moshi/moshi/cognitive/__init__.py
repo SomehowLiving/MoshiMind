@@ -20,6 +20,7 @@ from .sidecar import CognitiveSidecar, CognitiveRequest, CognitiveResult, Cognit
 from .speculation import SpeculativeSlot
 from .predictive_trigger import PredictiveTrigger
 from .multishot import MultiShotGate
+from .telemetry import RetrievalEvent, RetrievalTelemetry
 
 __all__ = [
     "ConfidenceScore",
@@ -34,4 +35,6 @@ __all__ = [
     "SpeculativeSlot",
     "PredictiveTrigger",
     "MultiShotGate",
+    "RetrievalEvent",
+    "RetrievalTelemetry",
 ]
