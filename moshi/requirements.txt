@@ -1,11 +1,23 @@
-einops==0.7.0
-safetensors==0.4.4
-sentencepiece==0.2.0
-sounddevice==0.5.0
+# NOTE: this file must stay in sync with the `dependencies` list in pyproject.toml.
+# pyproject.toml is the source of truth (used by `pip install -e .`); this file exists
+# only for tooling that expects a requirements.txt. Previously these two files carried
+# different, incompatible pins (e.g. torch==2.2.0 / sphn==0.1.4 here vs torch<2.10 /
+# sphn>=0.2.0,<0.3.0 in pyproject.toml) which could silently diverge — do not hand-edit
+# one without the other.
+numpy>=1.26,<2.3
+safetensors>=0.4.0,<0.8.0
+huggingface-hub>=0.24,<1.0.0
+einops>=0.7,<0.9
+sentencepiece>=0.2.0,<0.3
+sounddevice==0.5
+sphn>=0.2.0,<0.3.0
+torch>=2.2.0,<2.10
+aiohttp>=3.10.5,<3.12
+tqdm>=4.48
+openai>=2.26.0
+transformers==4.55.3
+xformers>=0.0.33.post2
+gradio>=5.50.0
+msgpack>=1.1.2
 soundfile==0.12.1
-sphn==0.1.4
-torch==2.2.0
-numpy==1.26.4
-aiohttp>=3.10.5, <3.11
-huggingface-hub>=0.24, <0.34
 pytest==8.3.3

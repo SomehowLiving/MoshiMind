@@ -94,6 +94,7 @@ class Channel:
             reference_generator=server.reference_generator,
             rag_timeout=server.rag_timeout,
             max_tokens=server.max_reference_tokens,
+            metrics=server.metrics,
         )
         self.audio_processor = AudioProcessor(power_threshold=server.power_threshold)
 
@@ -116,6 +117,9 @@ class Channel:
         self._stack: contextlib.AsyncExitStack | None = None
         self._task_group: asyncio.TaskGroup | None = None
         self._log = logging.LoggerAdapter(logger, extra={})
+        # Monotonically increasing id, bumped on every RAG trigger. Used to drop a
+        # reference encoding that finishes after a newer trigger has superseded it.
+        self._rag_seq: int = 0
 
     async def __aenter__(self) -> "Channel":
         self._stack = contextlib.AsyncExitStack()
@@ -159,12 +163,16 @@ class Channel:
     # Reference-text handling
     # ------------------------------------------------------------------
 
-    async def _handle_reference_text(self, reference_text: str | None, lm_label: str = ""):
+    async def _handle_reference_text(
+        self, reference_text: str | None, lm_label: str = "", trigger_seq: int | None = None
+    ):
         """Forward a freshly generated reference text to the UI and the LM.
 
         Args:
             reference_text: Generated reference text.
             lm_label: Display name of the LLM used for reference generation (sent to client UI).
+            trigger_seq: The ``_rag_seq`` value captured when this retrieval was triggered; used
+                to drop the ARC encoding if a newer trigger has since superseded it.
         """
         if reference_text is None:
             preview, ref_len = "", 0
@@ -177,21 +185,43 @@ class Channel:
             await self._encode_and_send_message(f"{lm_label}\t{reference_text}", type="referencetext", role="model")
         elif reference_text == "":
             await self._send_turn_outputs([("[RET_FAILED]", "model")])
+            self.server.metrics.increment("rag_llm_empty_total")
 
         self._log.info("[Reference] requesting ARC encoding for new reference")
         assert self._task_group is not None, "Channel.run() must be active"
-        self._task_group.create_task(self._async_update_reference(reference_text or ""))
+        self._task_group.create_task(self._async_update_reference(reference_text or "", trigger_seq))
 
-    async def _async_update_reference(self, reference_text: str):
+    async def _async_update_reference(self, reference_text: str, trigger_seq: int | None = None):
         request_started = time.time()
-        streaming_sum_tensor = await get_conditioning_remote_async(
-            text=reference_text,
-            encoder_url=self.server.reference_encoder_url,
-        )
+        try:
+            streaming_sum_tensor = await get_conditioning_remote_async(
+                text=reference_text,
+                encoder_url=self.server.reference_encoder_url,
+            )
+        except Exception as e:
+            # A transient ARC-encoder outage must degrade this turn's grounding, not take
+            # down the whole session: this task is spawned directly on the channel's
+            # TaskGroup, so an unhandled exception here would cancel every sibling task.
+            self._log.error(f"[Reference] ARC encoding request failed after {time.time() - request_started:.3f}s: {e}")
+            self.server.metrics.increment("rag_arc_encoder_errors_total")
+            await self._send_turn_outputs([("[RET_FAILED]", "model")])
+            return
+
+        elapsed = time.time() - request_started
         self._log.info(
-            f"[Reference] ARC encoding received in {time.time() - request_started:.3f}s "
+            f"[Reference] ARC encoding received in {elapsed:.3f}s "
             f"(streaming_sum {tuple(streaming_sum_tensor.shape)})"
         )
+        self.server.metrics.observe("rag_arc_encoder_latency_seconds", elapsed)
+
+        if trigger_seq is not None and trigger_seq != self._rag_seq:
+            self._log.info(
+                f"[Reference] dropping stale reference (trigger_seq={trigger_seq}, "
+                f"current={self._rag_seq}); a newer RAG trigger has already superseded it"
+            )
+            self.server.metrics.increment("rag_stale_reference_dropped_total")
+            return
+
         # Build a per-slot update list: only this channel's slot gets the new tensor.
         batch_size = self.server.batch_size
         # streaming_sum_tensor is [1, T, dim] from the remote encoder; squeeze batch dim.
@@ -346,10 +376,17 @@ class Channel:
                 assert self._task_group is not None
                 await self._send_turn_outputs([("[RET]", "model")])
                 await self.stt.flush()
+                self._rag_seq += 1
+                trigger_seq = self._rag_seq
+                self.server.metrics.increment("rag_triggers_total")
+
+                async def _handle_reference_fn(reference_text, lm_label="", _seq=trigger_seq):
+                    await self._handle_reference_text(reference_text, lm_label, trigger_seq=_seq)
+
                 await self.rag_manager.trigger(
                     task_group=self._task_group,
                     wait_steps=self.server.stt_wait_steps,
-                    handle_reference_fn=self._handle_reference_text,
+                    handle_reference_fn=_handle_reference_fn,
                     context_provider=self.turn_manager.get_context,
                 )
             else:

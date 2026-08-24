@@ -60,6 +60,39 @@ class _ColorFormatter(logging.Formatter):
         return super().format(record)
 
 
+class Metrics:
+    """Minimal in-process counters/histograms for the retrieval path.
+
+    No external metrics backend is wired in; this exists so RAG timeouts, ARC-encoder
+    latency, and fallback-profile usage are observable at all (via ``/api/metrics`` or
+    logs), instead of only ever showing up as scattered log lines.
+    """
+
+    def __init__(self):
+        self._counters: dict[str, int] = {}
+        self._observations: dict[str, list[float]] = {}
+
+    def increment(self, name: str, value: int = 1) -> None:
+        self._counters[name] = self._counters.get(name, 0) + value
+
+    def observe(self, name: str, value: float) -> None:
+        bucket = self._observations.setdefault(name, [])
+        bucket.append(value)
+        # Keep this bounded; it's a debugging aid, not a real metrics store.
+        if len(bucket) > 1000:
+            del bucket[: len(bucket) - 1000]
+
+    def snapshot(self) -> dict[str, Any]:
+        summary: dict[str, Any] = dict(self._counters)
+        for name, values in self._observations.items():
+            if not values:
+                continue
+            summary[f"{name}_count"] = len(values)
+            summary[f"{name}_avg"] = sum(values) / len(values)
+            summary[f"{name}_max"] = max(values)
+        return summary
+
+
 class ServerState:
     """Shared resources for every HTTP channel; owns a ``BatchRunner`` for GPU steps."""
 
@@ -83,6 +116,7 @@ class ServerState:
         self.text_tokenizer = text_tokenizer
         self.reference_encoder_url = reference_encoder_url
         self.rag_timeout = rag_timeout
+        self.metrics = Metrics()
         self.max_reference_tokens = max_reference_tokens
         self.vad_window_size = vad_window_size
         self.vad_threshold = vad_threshold
@@ -116,12 +150,14 @@ class ServerState:
         # Shared LLM used for reference generation. Per-channel reference history
         # is owned by each channel's ``RAGManager``, so the model itself is stateless.
         if len(self._retrieval_profiles) >= 2:
-            self.reference_generator = LLMReferenceGenerator(retrieval_profiles=self._retrieval_profiles)
+            self.reference_generator = LLMReferenceGenerator(
+                retrieval_profiles=self._retrieval_profiles, metrics=self.metrics
+            )
         else:
             style: str = "original"
             if n_prof == 1:
                 style = self._retrieval_profiles[0].prompt_style
-            self.reference_generator = LLMReferenceGenerator(prompt_style=style)
+            self.reference_generator = LLMReferenceGenerator(prompt_style=style, metrics=self.metrics)
 
         self.batch_size = batch_size
         self.device = device
@@ -408,6 +444,12 @@ def main():
         return web.json_response({"status": "ok"})
 
     app.router.add_get("/api/health", handle_health)
+
+    async def handle_metrics(_: web.Request) -> web.Response:
+        """GET /api/metrics: RAG-path counters (triggers, timeouts, ARC-encoder latency)."""
+        return web.json_response(state.metrics.snapshot())
+
+    app.router.add_get("/api/metrics", handle_metrics)
 
     async def handle_session_feedback(request: web.Request) -> web.Response:
         """

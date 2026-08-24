@@ -29,7 +29,15 @@ class LLMClient:
         self.top_p = 1.0
         self.top_k = 1
 
-        resolved_base = base_url or os.environ["LLM_BASE_URL"]
+        resolved_base = base_url or os.environ.get("LLM_BASE_URL")
+        if not resolved_base:
+            raise RuntimeError(
+                "LLM_BASE_URL environment variable must be set (and no per-profile base_url "
+                "was supplied). This is the retrieval LLM's OpenAI-compatible endpoint. "
+                "Please set it to e.g.:\n"
+                "  export LLM_BASE_URL=https://api.openai.com/v1\n"
+                "or point it at any local OpenAI-compatible server (vLLM, Ollama, etc.)."
+            )
         resolved_key = api_key if api_key is not None else os.environ.get("LLM_API_KEY", None)
         self.client = OpenAI(
             base_url=resolved_base,

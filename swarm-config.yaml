@@ -17,7 +17,7 @@ services:
       # Let's Encrypt configuration
       - "--certificatesResolvers.letsencrypt.acme.httpChallenge.entryPoint=web"
       - "--certificatesResolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-      - "--certificatesResolvers.letsencrypt.acme.email=gabriel@kyutai.org"
+      - "--certificatesResolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL:-gabriel@kyutai.org}"
       - "--certificatesResolvers.letsencrypt.acme.httpChallenge=true"
       - "--log.level=TRACE"
     ports:
@@ -32,13 +32,13 @@ services:
           - node.role == manager
 
   frontend:
-    image: rg.fr-par.scw.cloud/namespace-unruffled-tereshkova/moshi-rag-frontend:tmp
+    image: ${IMAGE_REGISTRY:-rg.fr-par.scw.cloud/namespace-unruffled-tereshkova}/moshi-rag-frontend:${IMAGE_TAG:-tmp}
     build:
       context: client/
     deploy:
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.frontend.rule=Host(`moshi-rag.kyutai.org`) && PathPrefix(`/`)"
+        - "traefik.http.routers.frontend.rule=Host(`${DEPLOY_DOMAIN:-moshi-rag.kyutai.org}`) && PathPrefix(`/`)"
         - "traefik.http.routers.frontend.entrypoints=websecure"
         - "traefik.http.routers.frontend.tls=true"
         - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
@@ -46,7 +46,7 @@ services:
         - "traefik.http.routers.frontend.priority=10"
 
   backend:
-    image: rg.fr-par.scw.cloud/namespace-unruffled-tereshkova/moshi-rag-backend:tmp
+    image: ${IMAGE_REGISTRY:-rg.fr-par.scw.cloud/namespace-unruffled-tereshkova}/moshi-rag-backend:${IMAGE_TAG:-tmp}
     build:
       context: moshi/
     environment:
@@ -57,7 +57,7 @@ services:
       - "LLM_API_KEY=${LLM_API_KEY}"
       - "LLM_MODEL_NAME=${LLM_MODEL_NAME}"
       - "ARC_ENCODER_URL=http://arc_encoder:80"
-      - "STT_URL=wss://eu.api.gradium.ai/api/speech/asr"
+      - "STT_URL=${STT_URL:-wss://eu.api.gradium.ai/api/speech/asr}"
       - "STT_API_KEY=${STT_API_KEY}"
     volumes:
       - /scratch/models:/models
@@ -68,7 +68,7 @@ services:
     deploy:
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.backend.rule=Host(`moshi-rag.kyutai.org`) && PathPrefix(`/api`)"
+        - "traefik.http.routers.backend.rule=Host(`${DEPLOY_DOMAIN:-moshi-rag.kyutai.org}`) && PathPrefix(`/api`)"
         - "traefik.http.routers.backend.entrypoints=websecure"
         - "traefik.http.routers.backend.tls=true"
         - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
@@ -82,7 +82,7 @@ services:
                 value: 1
 
   arc_encoder:
-    image: rg.fr-par.scw.cloud/namespace-unruffled-tereshkova/moshi-rag-arc-encoder:tmp
+    image: ${IMAGE_REGISTRY:-rg.fr-par.scw.cloud/namespace-unruffled-tereshkova}/moshi-rag-arc-encoder:${IMAGE_TAG:-tmp}
     build:
       context: moshi/
       dockerfile: Dockerfile.arc_encoder

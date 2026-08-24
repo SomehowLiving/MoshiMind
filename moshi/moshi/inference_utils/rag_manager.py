@@ -29,11 +29,13 @@ class RAGManager:
         rag_timeout: float = 1.5,
         max_tokens: int = 512,
         gt_reference_text: str | None = None,
+        metrics=None,
     ):
         self.reference_generator = reference_generator
         self.rag_timeout = rag_timeout
         self.max_tokens = max_tokens
         self.gt_reference_text = gt_reference_text
+        self.metrics = metrics
         self._history: ReferenceHistory = []
         self._wait_steps_remaining: int = 0
         self._wait_event: asyncio.Event | None = None
@@ -91,9 +93,13 @@ class RAGManager:
             logger.warning(
                 f"[Reference] Reference generation timed out after {self.rag_timeout}s, returning empty string"
             )
+            if self.metrics is not None:
+                self.metrics.increment("rag_llm_timeouts_total")
             return "", "", self.rag_timeout, ""
         except Exception as e:
             logger.error(f"[Reference] Error generating reference: {e}, returning empty string")
+            if self.metrics is not None:
+                self.metrics.increment("rag_llm_errors_total")
             return "", "", self.rag_timeout, ""
 
     def warmup(self):

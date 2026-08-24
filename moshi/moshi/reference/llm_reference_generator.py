@@ -40,6 +40,7 @@ class LLMReferenceGenerator:
         retrieval_profiles: list[RetrievalProfile] | None = None,
         *,
         prompt_style: str = "simplified",
+        metrics=None,
     ):
         """
         Initialize reference manager
@@ -48,10 +49,12 @@ class LLMReferenceGenerator:
             summarization: Whether to summarize the reference text
             retrieval_profiles: If at least two profiles, use per-profile endpoints; else env `get_llm`.
             prompt_style: For fewer than two profiles: bundled template. With multiple profiles, each profile's ``prompt_style`` is used instead.
+            metrics: Optional counters object (see ``server.Metrics``) to record fallback usage.
         """
         self.summarization = summarization
         self.retrieval_profiles = list(retrieval_profiles or [])
         self._llm_by_id: dict[str, LLMClient] = {}
+        self.metrics = metrics
 
         if summarization:
             prompt_type = "reference_summarization"
@@ -236,6 +239,8 @@ class LLMReferenceGenerator:
                             active_profile_id,
                             self._default_profile_id,
                         )
+                        if self.metrics is not None:
+                            self.metrics.increment("rag_profile_fallback_total")
         else:
             try:
                 fut = loop.run_in_executor(None, self.llm.generate, self.llm.prompt, context, max_tokens)
