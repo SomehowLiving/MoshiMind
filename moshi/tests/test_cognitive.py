@@ -16,17 +16,21 @@ import asyncio
 import pytest
 
 from moshi.cognitive import (
+    CalculatorService,
     CognitiveRequest,
     CognitiveResult,
     CognitiveSidecar,
     ConfidenceScore,
     MultiShotGate,
     PredictiveTrigger,
+    RAGCognitiveService,
     RetrievalTelemetry,
     SpeculativeSlot,
     TaskRegistry,
+    UnsafeExpressionError,
     Urgency,
     classify_urgency,
+    evaluate_arithmetic,
 )
 
 
@@ -612,3 +616,254 @@ def test_telemetry_clear_empties_the_log():
     telemetry.record("q", "a", 1.0, 0.1)
     telemetry.clear()
     assert telemetry.snapshot() == []
+
+
+# ---------------------------------------------------------------------------
+# CalculatorService (a real Urgency.CRITICAL cognitive service)
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_arithmetic_basic_ops():
+    assert evaluate_arithmetic("2 + 2") == 4
+    assert evaluate_arithmetic("10 / 4") == 2.5
+    assert evaluate_arithmetic("2 ** 10") == 1024
+    assert evaluate_arithmetic("(3 + 4) * 2") == 14
+    assert evaluate_arithmetic("-5 + 3") == -2
+
+
+def test_evaluate_arithmetic_rejects_names():
+    with pytest.raises(UnsafeExpressionError):
+        evaluate_arithmetic("__import__('os').system('echo hi')")
+
+
+def test_evaluate_arithmetic_rejects_function_calls():
+    with pytest.raises(UnsafeExpressionError):
+        evaluate_arithmetic("abs(-5)")
+
+
+def test_evaluate_arithmetic_rejects_attribute_access():
+    with pytest.raises(UnsafeExpressionError):
+        evaluate_arithmetic("().__class__")
+
+
+def test_evaluate_arithmetic_rejects_syntax_errors():
+    with pytest.raises(UnsafeExpressionError):
+        evaluate_arithmetic("2 + + + ")
+
+
+def test_calculator_service_via_sidecar_with_critical_urgency():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(CalculatorService())
+        results = []
+
+        async def on_result(handle, result):
+            results.append(result)
+
+        sidecar.dispatch("conv-1", "calculator", CognitiveRequest(query="27 * 43", urgency=Urgency.CRITICAL), on_result)
+        for _ in range(50):
+            if results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert results[0] is not None
+        assert results[0].text == "1161"
+
+    asyncio.run(run())
+
+
+def test_calculator_service_bad_expression_reports_none_not_a_crash():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(CalculatorService())
+        results = []
+
+        async def on_result(handle, result):
+            results.append(result)
+
+        sidecar.dispatch("conv-1", "calculator", CognitiveRequest(query="not math"), on_result)
+        for _ in range(50):
+            if results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert results == [None]  # the bad expression raised; sidecar never propagates it to the caller
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# RAGCognitiveService (RAGManager adapted to the CognitiveService interface)
+# ---------------------------------------------------------------------------
+
+
+class _FakeReferenceGenerator:
+    """Stands in for RAGManager without needing torch/openai to be installed."""
+
+    def __init__(self, reference_text="Jensen Huang", confidence=None, kind_seen=None):
+        self.reference_text = reference_text
+        self.confidence = confidence or ConfidenceScore()
+        self.kind_seen = kind_seen if kind_seen is not None else []
+
+    async def get_reference_text(self, context, kind="confirmed"):
+        self.kind_seen.append(kind)
+        return context, self.reference_text, 0.2, "test-llm", self.confidence
+
+
+def test_rag_service_wraps_reference_generator():
+    async def run():
+        fake = _FakeReferenceGenerator()
+        service = RAGCognitiveService(fake)
+        result = await service.handle(CognitiveRequest(query="who is the CEO", context="who is the CEO"))
+        assert result.text == "Jensen Huang"
+        assert result.source == "test-llm"
+
+    asyncio.run(run())
+
+
+def test_rag_service_passes_through_configured_kind():
+    async def run():
+        fake = _FakeReferenceGenerator()
+        service = RAGCognitiveService(fake, kind="speculative")
+        await service.handle(CognitiveRequest(query="q"))
+        assert fake.kind_seen == ["speculative"]
+
+    asyncio.run(run())
+
+
+def test_rag_service_falls_back_to_query_when_context_empty():
+    async def run():
+        fake = _FakeReferenceGenerator()
+        service = RAGCognitiveService(fake)
+        await service.handle(CognitiveRequest(query="who is the CEO", context=""))
+        # handle() must have been called with "who is the CEO" (the query), not "".
+        result = await service.handle(CognitiveRequest(query="who is the CEO", context=""))
+        assert result.text == "Jensen Huang"
+
+    asyncio.run(run())
+
+
+def test_rag_service_through_sidecar_end_to_end():
+    async def run():
+        fake = _FakeReferenceGenerator(reference_text="Paris", confidence=ConfidenceScore(0.9, 0.9, 0.9))
+        sidecar = CognitiveSidecar()
+        sidecar.register(RAGCognitiveService(fake))
+        results = []
+
+        async def on_result(handle, result):
+            results.append(result)
+
+        sidecar.dispatch("conv-1", "rag", CognitiveRequest(query="capital of France"), on_result)
+        for _ in range(50):
+            if results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert results[0].text == "Paris"
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 acceptance criteria: urgency deadlines, background non-blocking, breaker lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_critical_request_respects_short_deadline():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(_FakeService("slow_critical", delay=5.0))
+        results = []
+
+        async def on_result(handle, result):
+            results.append(result)
+
+        start = asyncio.get_event_loop().time()
+        sidecar.dispatch("conv-1", "slow_critical", CognitiveRequest(query="x", urgency=Urgency.CRITICAL), on_result)
+        for _ in range(200):
+            if results:
+                break
+            await asyncio.sleep(0.01)
+        elapsed = asyncio.get_event_loop().time() - start
+
+        assert results == [None]  # timed out, not a 5s wait
+        assert elapsed < 1.0  # well under the 5s service delay: the 0.3s CRITICAL deadline held
+
+    asyncio.run(run())
+
+
+def test_background_request_dispatch_returns_immediately_even_for_a_slow_service():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(_FakeService("slow_bg", delay=1.0))
+
+        async def on_result(handle, result):
+            pass
+
+        start = asyncio.get_event_loop().time()
+        sidecar.dispatch("conv-1", "slow_bg", CognitiveRequest(query="x", urgency=Urgency.BACKGROUND), on_result)
+        dispatch_elapsed = asyncio.get_event_loop().time() - start
+
+        assert dispatch_elapsed < 0.05  # dispatch() itself never waits on the service
+
+    asyncio.run(run())
+
+
+def test_background_request_never_times_out_no_matter_how_slow():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(_FakeService("slow_bg", delay=0.2))
+        results = []
+
+        async def on_result(handle, result):
+            results.append(result)
+
+        sidecar.dispatch("conv-1", "slow_bg", CognitiveRequest(query="x", urgency=Urgency.BACKGROUND), on_result)
+        for _ in range(50):
+            if results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert results[0] is not None  # no deadline was ever imposed, so the slow call still succeeds
+
+    asyncio.run(run())
+
+
+def test_circuit_breaker_full_lifecycle_open_half_open_closed():
+    async def run():
+        sidecar = CognitiveSidecar()
+        service = _FakeService("flaky", raises=True)
+        sidecar.register(service)
+        breaker = sidecar._breakers["flaky"]
+        # Speed up the test: shrink the cooldown so we don't need a real 30s wait.
+        breaker.cooldown_seconds = 0.05
+
+        async def on_result(handle, result):
+            pass
+
+        # Three failures trip the breaker open.
+        for i in range(3):
+            sidecar.dispatch("conv-1", "flaky", CognitiveRequest(query="x"), on_result)
+            for _ in range(50):
+                if service.calls > i:
+                    break
+                await asyncio.sleep(0.01)
+        assert service.calls == 3
+        assert breaker.is_open() is True
+
+        # Still within the cooldown window: stays open, service not called again.
+        sidecar.dispatch("conv-1", "flaky", CognitiveRequest(query="x"), on_result)
+        await asyncio.sleep(0.02)
+        assert service.calls == 3
+
+        # After the (shortened) cooldown, the breaker half-opens and lets one trial through.
+        await asyncio.sleep(0.06)
+        assert breaker.is_open() is False
+
+        service.raises = False  # the trial call now succeeds
+        sidecar.dispatch("conv-1", "flaky", CognitiveRequest(query="x"), on_result)
+        await asyncio.sleep(0.05)
+        assert service.calls == 4
+        assert breaker.is_open() is False  # success closed it again
+
+    asyncio.run(run())

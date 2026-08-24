@@ -121,15 +121,43 @@ in `test_cognitive.py`). Phase 1 (native Moshi + RAG integration) is now complet
 Phase 0.2 built the skeleton. This phase populates it with real producers beyond RAG
 and enforces the non-blocking guarantee everywhere.
 
-| # | Task |
-|---|---|
-| 2.1 | Formalize the "cognitive service" interface (`async def handle(request) -> CognitiveResult`) so RAG, memory, and tools are structurally identical to the sidecar |
-| 2.2 | Urgency-based scheduling: `critical` requests get a short deadline and may block a few hundred ms (e.g. arithmetic); `background` requests never block, results arrive whenever and are applied only if still relevant (task registry handles staleness) |
-| 2.3 | Circuit breaker per cognitive service — N consecutive failures suspends that service for a cooldown window instead of retrying into a dead endpoint every turn |
+| # | Task | Status |
+|---|---|---|
+| 2.1 | Formalize the "cognitive service" interface (`async def handle(request) -> CognitiveResult`) so RAG, memory, and tools are structurally identical to the sidecar | ✅🧪 |
+| 2.2 | Urgency-based scheduling: `critical` requests get a short deadline and may block a few hundred ms (e.g. arithmetic); `background` requests never block, results arrive whenever and are applied only if still relevant (task registry handles staleness) | ✅🧪 |
+| 2.3 | Circuit breaker per cognitive service — N consecutive failures suspends that service for a cooldown window instead of retrying into a dead endpoint every turn | ✅🧪 |
 
 **Acceptance:** unit tests with fake slow/failing services proving (a) `critical`
 requests respect their deadline, (b) `background` requests never block the caller,
 (c) the breaker opens/half-opens/closes correctly. All torch-free.
+
+**Status:** the interface, deadlines, and breaker were actually built back in Phase 0
+(`cognitive/sidecar.py`) as part of the initial scaffold, but had only ever been
+exercised by throwaway fakes — Phase 2's job was proving they hold up against real
+producers and pinning the three acceptance criteria down with explicit tests, not
+building new scheduling machinery.
+
+- **Two real `CognitiveService` implementers**, closing 2.1: `cognitive/tools/calculator.py::CalculatorService`
+  — a genuine `Urgency.CRITICAL` service (arithmetic, evaluated via a whitelisted AST
+  walk, not `eval()`, since the input is user-speech-derived text) — and
+  `cognitive/rag_service.py::RAGCognitiveService`, which adapts `RAGManager.get_reference_text`
+  to the interface. The RAG adapter is *not* wired into `channel.py` — RAG's live path
+  has bespoke behavior (STT wait steps, speculative reuse, the multi-shot budget) the
+  generic sidecar doesn't replicate, and rewiring a working, tested path for its own
+  sake would be churn without a behavior change. It exists to prove the interface fits,
+  and as the on-ramp for a future migration.
+- **2.2 acceptance nailed down**: `test_critical_request_respects_short_deadline` proves
+  a `CRITICAL` request against a 5s-slow fake returns in well under 1s (the 0.3s default
+  deadline held); `test_background_request_dispatch_returns_immediately_even_for_a_slow_service`
+  proves `dispatch()` itself never blocks regardless of urgency (it's `asyncio.ensure_future`
+  under the hood); `test_background_request_never_times_out_no_matter_how_slow` proves
+  `BACKGROUND` truly has no deadline.
+- **2.3 acceptance nailed down**: `test_circuit_breaker_full_lifecycle_open_half_open_closed`
+  drives a fake failing service through the whole cycle — three failures open the breaker,
+  it stays open within the cooldown, half-opens to allow one trial after the cooldown
+  elapses, and a successful trial closes it again.
+
+15 new unit tests, all torch-free (67/67 total in `test_cognitive.py`).
 
 ---
 

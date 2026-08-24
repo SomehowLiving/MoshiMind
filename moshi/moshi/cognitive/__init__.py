@@ -21,6 +21,8 @@ from .speculation import SpeculativeSlot
 from .predictive_trigger import PredictiveTrigger
 from .multishot import MultiShotGate
 from .telemetry import RetrievalEvent, RetrievalTelemetry
+from .rag_service import RAGCognitiveService
+from .tools.calculator import CalculatorService, evaluate_arithmetic, UnsafeExpressionError
 
 __all__ = [
     "ConfidenceScore",
@@ -37,4 +39,8 @@ __all__ = [
     "MultiShotGate",
     "RetrievalEvent",
     "RetrievalTelemetry",
+    "RAGCognitiveService",
+    "CalculatorService",
+    "evaluate_arithmetic",
+    "UnsafeExpressionError",
 ]
