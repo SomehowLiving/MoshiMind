@@ -192,16 +192,58 @@ Kept structurally separate from RAG (`RAG` = what does the world know, `memory` 
 what does *this* user/conversation know) even though both ultimately compete for the
 same conditioning channel into Moshi.
 
-| # | Task |
-|---|---|
-| 3.1 | Working memory — already exists as `turn_manager.get_context()`; formalize its window and eviction policy |
-| 3.2 | Episodic memory — persist salient turns (heuristic: turns near a topic change, an emotional peak, or an explicit "remember this") to a per-user store keyed off session id |
-| 3.3 | Semantic memory — durable facts/preferences extracted from episodic memory on a slower cadence (batch job, not per-turn) |
-| 3.4 | Memory retrieval as a second cognitive-sidecar producer, competing with RAG for conditioning bandwidth — needs a merge policy (Phase 1.1's confidence score is the natural arbitration signal) |
+| # | Task | Status |
+|---|---|---|
+| 3.1 | Working memory — already exists as `turn_manager.get_context()`; formalize its window and eviction policy | ✅🧪 |
+| 3.2 | Episodic memory — persist salient turns (heuristic: turns near a topic change, an emotional peak, or an explicit "remember this") to a per-user store keyed off session id | ✅🧪 |
+| 3.3 | Semantic memory — durable facts/preferences extracted from episodic memory on a slower cadence (batch job, not per-turn) | ✅🧪 |
+| 3.4 | Memory retrieval as a second cognitive-sidecar producer, competing with RAG for conditioning bandwidth — needs a merge policy (Phase 1.1's confidence score is the natural arbitration signal) | ✅🧪 |
 
 **Acceptance:** memory store and retrieval logic are pure Python/SQLite — fully
 testable without a GPU. Integration with the conditioning channel is BLOCKED here,
 same as Phase 1.
+
+**Status:** all four implemented under `cognitive/memory/`, none wired into
+`channel.py`/`turn_manager.py` live yet (same "prove the primitive, wire it later"
+pattern as `cognitive.rag_service` and the Phase 2 cancellation machinery) — this
+phase is about proving the storage, extraction, and arbitration logic is correct in
+isolation, not about swapping out a working live conversation path.
+
+- **3.1** `cognitive/memory/working_memory.py::WorkingMemory` — bounded by both turn
+  count and total characters (either can dominate depending on the conversation),
+  evicting oldest-first, always keeping at least one turn even if a single turn
+  exceeds the character budget.
+- **3.2** `cognitive/memory/store.py::MemoryStore` (SQLite, stdlib — no new dependency,
+  genuinely durable across process restarts, not just in-process state) plus
+  `cognitive/memory/salience.py::score_salience`, a placeholder heuristic (explicit
+  "remember this"-style phrases score highest; long turns moderately; bare questions
+  low) standing in for the topic-change/emotion signals PHASES.md's own description
+  calls for but this repo can't detect yet (emotion is Phase 5).
+- **3.3** `cognitive/memory/semantic_extraction.py::extract_facts` — a deliberately
+  simple regex-pattern extractor (name/occupation/location/preference), explicitly
+  labeled as a placeholder for the real implementation (an LLM pass over accumulated
+  episodes, off the critical path — the same pattern RAG's reference generation
+  already uses). Caught and fixed a real bug during testing: the initial pattern was
+  greedy past clause boundaries ("my name is Nidhi and I work as an engineer" was
+  extracting "Nidhi and I work as an engineer" as the name) — fixed with a word-count
+  cap plus a conjunction cutoff, verified with a regression test.
+- **3.4** `cognitive/memory/memory_service.py::MemoryCognitiveService` — structurally
+  identical `CognitiveService` to `RAGCognitiveService`, so both can be dispatched
+  through the same sidecar; `cognitive/merge.py::merge_candidates` arbitrates between
+  whatever candidates come back, ranking by `ConfidenceScore.strength()` and greedily
+  concatenating the strongest ones within a character budget (RAG and memory are
+  usually complementary, not conflicting, so combining beats picking one and
+  discarding the other) — the merged result's confidence is the strongest single
+  candidate's own score, not an average, so one weak scrap can't dilute a strong hit.
+- `user_id` is a known placeholder: this repo has no authentication layer (per the
+  earlier execution audit), so there's no real "same user across sessions" concept
+  yet — callers currently have nothing better than a per-connection id, making
+  memory effectively per-conversation until a real identity system exists. That
+  limitation lives in the caller, documented in `cognitive/memory/store.py`.
+
+36 new unit tests, all torch-free, including genuine sqlite3 execution (not mocked)
+and a persistence round-trip test (write, close, reopen, read back). 113/113 total
+across `test_cognitive.py` + `test_memory.py`.
 
 ---
 
