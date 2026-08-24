@@ -867,3 +867,178 @@ def test_circuit_breaker_full_lifecycle_open_half_open_closed():
         assert breaker.is_open() is False  # success closed it again
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Active cancellation (cancel / cancel_stale / cancel_all / dispatch_and_wait)
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_and_wait_returns_the_result():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(CalculatorService())
+        result = await sidecar.dispatch_and_wait(
+            "conv-1", "calculator", CognitiveRequest(query="6 * 7", urgency=Urgency.CRITICAL)
+        )
+        assert result is not None
+        assert result.text == "42"
+
+    asyncio.run(run())
+
+
+def test_dispatch_and_wait_returns_none_on_failure_without_raising():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(CalculatorService())
+        result = await sidecar.dispatch_and_wait(
+            "conv-1", "calculator", CognitiveRequest(query="not math", urgency=Urgency.CRITICAL)
+        )
+        assert result is None
+
+    asyncio.run(run())
+
+
+def test_dispatch_and_wait_still_works_for_non_critical_requests():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(CalculatorService())
+        result = await sidecar.dispatch_and_wait("conv-1", "calculator", CognitiveRequest(query="1 + 1"))
+        assert result.text == "2"
+
+    asyncio.run(run())
+
+
+def test_cancel_stops_a_still_running_task():
+    async def run():
+        sidecar = CognitiveSidecar()
+        service = _FakeService("slow", delay=10.0)
+        sidecar.register(service)
+        results = []
+
+        async def on_result(handle, result):
+            results.append(result)
+
+        handle = sidecar.dispatch(
+            "conv-1", "slow", CognitiveRequest(query="x", urgency=Urgency.BACKGROUND), on_result
+        )
+        await asyncio.sleep(0.01)  # let it actually start
+        cancelled = sidecar.cancel(handle)
+        await asyncio.sleep(0.01)
+
+        assert cancelled is True
+        assert results == []  # on_result was never called: the task was killed, not resolved
+
+    asyncio.run(run())
+
+
+def test_cancel_on_already_finished_task_returns_false():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(CalculatorService())
+        results = []
+
+        async def on_result(handle, result):
+            results.append(result)
+
+        handle = sidecar.dispatch("conv-1", "calculator", CognitiveRequest(query="1 + 1"), on_result)
+        for _ in range(50):
+            if results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert sidecar.cancel(handle) is False
+
+    asyncio.run(run())
+
+
+def test_cancel_stale_kills_only_tasks_from_the_superseded_turn():
+    async def run():
+        registry = TaskRegistry()
+        sidecar = CognitiveSidecar(registry=registry)
+        slow_a = _FakeService("slow_a", delay=10.0)
+        slow_b = _FakeService("slow_b", delay=10.0)
+        sidecar.register(slow_a)
+        sidecar.register(slow_b)
+
+        async def on_result(handle, result):
+            pass
+
+        # slow_a starts on turn 0.
+        sidecar.dispatch("conv-1", "slow_a", CognitiveRequest(query="x", urgency=Urgency.BACKGROUND), on_result)
+        await asyncio.sleep(0.01)
+
+        registry.advance_turn("conv-1")  # user starts a new turn
+
+        # slow_b starts fresh, on the new turn 1.
+        sidecar.dispatch("conv-1", "slow_b", CognitiveRequest(query="x", urgency=Urgency.BACKGROUND), on_result)
+        await asyncio.sleep(0.01)
+
+        cancelled = sidecar.cancel_stale("conv-1")
+        await asyncio.sleep(0.01)
+
+        assert cancelled == 1  # only slow_a (turn 0) was cancelled
+        assert slow_a.calls == 1  # it did start running before being killed
+        # slow_b's task must still be tracked (not cancelled) since it's on the current turn.
+        assert any(h.kind == "slow_b" and not t.done() for h, t in sidecar._tasks.values())
+
+    asyncio.run(run())
+
+
+def test_cancel_stale_is_a_noop_when_nothing_is_superseded():
+    async def run():
+        registry = TaskRegistry()
+        sidecar = CognitiveSidecar(registry=registry)
+        sidecar.register(_FakeService("slow", delay=10.0))
+
+        async def on_result(handle, result):
+            pass
+
+        sidecar.dispatch("conv-1", "slow", CognitiveRequest(query="x", urgency=Urgency.BACKGROUND), on_result)
+        await asyncio.sleep(0.01)
+
+        assert sidecar.cancel_stale("conv-1") == 0  # turn never advanced
+
+    asyncio.run(run())
+
+
+def test_cancel_all_kills_every_task_for_the_conversation_regardless_of_turn():
+    async def run():
+        registry = TaskRegistry()
+        sidecar = CognitiveSidecar(registry=registry)
+        sidecar.register(_FakeService("slow", delay=10.0))
+
+        async def on_result(handle, result):
+            pass
+
+        sidecar.dispatch("conv-1", "slow", CognitiveRequest(query="a", urgency=Urgency.BACKGROUND), on_result)
+        await asyncio.sleep(0.01)
+        registry.advance_turn("conv-1")
+        sidecar.dispatch("conv-1", "slow", CognitiveRequest(query="b", urgency=Urgency.BACKGROUND), on_result)
+        await asyncio.sleep(0.01)
+
+        cancelled = sidecar.cancel_all("conv-1")
+
+        assert cancelled == 2  # both turns' tasks killed, not just the stale one
+
+    asyncio.run(run())
+
+
+def test_cancel_all_does_not_touch_other_conversations():
+    async def run():
+        sidecar = CognitiveSidecar()
+        sidecar.register(_FakeService("slow", delay=10.0))
+
+        async def on_result(handle, result):
+            pass
+
+        sidecar.dispatch("conv-1", "slow", CognitiveRequest(query="a", urgency=Urgency.BACKGROUND), on_result)
+        sidecar.dispatch("conv-2", "slow", CognitiveRequest(query="b", urgency=Urgency.BACKGROUND), on_result)
+        await asyncio.sleep(0.01)
+
+        cancelled = sidecar.cancel_all("conv-1")
+
+        assert cancelled == 1
+        assert any(h.conversation_id == "conv-2" and not t.done() for h, t in sidecar._tasks.values())
+
+    asyncio.run(run())

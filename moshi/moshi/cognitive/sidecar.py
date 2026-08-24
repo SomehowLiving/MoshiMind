@@ -122,6 +122,10 @@ class CognitiveSidecar:
         self.registry = registry or TaskRegistry()
         self._services: dict[str, CognitiveService] = {}
         self._breakers: dict[str, _CircuitBreaker] = {}
+        # Tracks every not-yet-finished dispatched task, so a superseded turn can
+        # actively cancel the underlying work instead of just discarding whatever
+        # result eventually shows up (see cancel_stale/cancel_all).
+        self._tasks: dict[int, tuple[TaskHandle, asyncio.Task]] = {}
 
     def register(self, service: CognitiveService) -> None:
         self._services[service.name] = service
@@ -142,8 +146,89 @@ class CognitiveSidecar:
         reported as ``on_result(handle, None)``.
         """
         handle = self.registry.new_task(conversation_id, kind=service_name)
-        asyncio.ensure_future(self._run(handle, service_name, request, on_result))
+        task = asyncio.ensure_future(self._run(handle, service_name, request, on_result))
+        self._tasks[handle.task_id] = (handle, task)
+        task.add_done_callback(lambda _t, task_id=handle.task_id: self._tasks.pop(task_id, None))
         return handle
+
+    async def dispatch_and_wait(
+        self,
+        conversation_id: str,
+        service_name: str,
+        request: CognitiveRequest,
+    ) -> CognitiveResult | None:
+        """Convenience for a caller that wants to await a result directly rather than
+        supplying an ``on_result`` callback. Intended for ``Urgency.CRITICAL`` requests,
+        where a short blocking wait is the point (see ``cognitive.urgency``) — using
+        this for ``NORMAL``/``BACKGROUND`` requests defeats the purpose of dispatching
+        them off the critical path, so it logs a warning if the request isn't critical.
+
+        Still returns ``None`` rather than raising on failure/timeout/breaker-open,
+        same as the callback path — the caller decides what "no answer" means.
+        """
+        if request.urgency is not Urgency.CRITICAL:
+            logger.warning(
+                "[Sidecar] dispatch_and_wait used for a %s request to %r; "
+                "this blocks the caller, which defeats the point for non-CRITICAL work",
+                request.urgency.value,
+                service_name,
+            )
+        result_holder: dict[str, CognitiveResult | None] = {}
+        done = asyncio.Event()
+
+        async def _capture(_handle: TaskHandle, result: CognitiveResult | None) -> None:
+            result_holder["result"] = result
+            done.set()
+
+        self.dispatch(conversation_id, service_name, request, _capture)
+        await done.wait()
+        return result_holder.get("result")
+
+    def cancel(self, handle: TaskHandle) -> bool:
+        """Actively cancel one dispatched task if it hasn't finished yet.
+
+        Returns ``True`` if a running task was cancelled, ``False`` if it had
+        already finished (or was never tracked, e.g. an unknown-service handle).
+        """
+        entry = self._tasks.get(handle.task_id)
+        if entry is None:
+            return False
+        _, task = entry
+        if task.done():
+            return False
+        task.cancel()
+        return True
+
+    def cancel_stale(self, conversation_id: str) -> int:
+        """Cancel every outstanding task for ``conversation_id`` whose turn no longer
+        matches the registry's current turn.
+
+        Call this right after ``TaskRegistry.advance_turn`` so superseded retrieval/
+        memory/tool calls stop consuming LLM calls, HTTP connections, and GPU time the
+        moment they're known to be irrelevant, instead of running to completion only to
+        have their result discarded on arrival by the existing staleness check in ``_run``.
+        Returns the number of tasks actually cancelled.
+        """
+        current_turn = self.registry.current_turn(conversation_id)
+        cancelled = 0
+        for handle, task in list(self._tasks.values()):
+            if handle.conversation_id == conversation_id and handle.turn_id != current_turn and not task.done():
+                task.cancel()
+                cancelled += 1
+        return cancelled
+
+    def cancel_all(self, conversation_id: str) -> int:
+        """Cancel every outstanding task for ``conversation_id`` regardless of turn.
+
+        Use on channel/conversation teardown so nothing keeps running past the
+        conversation's lifetime. Returns the number of tasks actually cancelled.
+        """
+        cancelled = 0
+        for handle, task in list(self._tasks.values()):
+            if handle.conversation_id == conversation_id and not task.done():
+                task.cancel()
+                cancelled += 1
+        return cancelled
 
     async def _run(
         self,

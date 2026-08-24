@@ -159,6 +159,31 @@ building new scheduling machinery.
 
 15 new unit tests, all torch-free (67/67 total in `test_cognitive.py`).
 
+**Pushed further:** staleness was only *passive* — a superseded task ran to completion
+and its result was silently discarded on arrival (`_run`'s `registry.is_current` check).
+That leaves a stale LLM call/HTTP connection/GPU-adjacent work running for no reason
+after the conversation has moved on. `CognitiveSidecar` now tracks every dispatched
+task's `asyncio.Task` alongside its `TaskHandle` and adds:
+
+- `cancel(handle)` — cancel one specific dispatched task if still running.
+- `cancel_stale(conversation_id)` — cancel every outstanding task whose `turn_id` no
+  longer matches the registry's current turn; call this right after
+  `TaskRegistry.advance_turn` so superseded work actually stops instead of running to
+  a discarded result.
+- `cancel_all(conversation_id)` — cancel everything for a conversation, for teardown.
+- `dispatch_and_wait(...)` — a direct-await convenience for `Urgency.CRITICAL` callers
+  (e.g. the calculator) who don't want to set up an `on_result` callback just to get
+  one blocking answer; warns (doesn't refuse) if used for non-critical urgency, since
+  that would defeat the point of dispatching those off the critical path.
+
+Not yet wired into `channel.py`: no live `CognitiveSidecar` instance exists in the
+server today (RAG's live path still calls `RAGManager` directly, per the 2.1 scoping
+note above), so calling `cancel_stale` on turn transitions has nothing to attach to
+yet. This machinery is ready for the first live sidecar user — most likely Phase 3
+(memory), where the cost of letting a superseded background lookup keep running is
+more concrete than it is for the not-yet-migrated RAG path. 11 new unit tests, all
+torch-free (76/76 total in `test_cognitive.py`).
+
 ---
 
 ## Phase 3 — 🔴 Long-term conversational memory
