@@ -17,6 +17,8 @@ from .confidence import ConfidenceScore
 from .urgency import Urgency, classify_urgency
 from .task_registry import TaskRegistry, TaskHandle
 from .sidecar import CognitiveSidecar, CognitiveRequest, CognitiveResult, CognitiveService
+from .speculation import SpeculativeSlot
+from .predictive_trigger import PredictiveTrigger
 
 __all__ = [
     "ConfidenceScore",
@@ -28,4 +30,6 @@ __all__ = [
     "CognitiveRequest",
     "CognitiveResult",
     "CognitiveService",
+    "SpeculativeSlot",
+    "PredictiveTrigger",
 ]

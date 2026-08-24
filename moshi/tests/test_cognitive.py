@@ -20,6 +20,8 @@ from moshi.cognitive import (
     CognitiveResult,
     CognitiveSidecar,
     ConfidenceScore,
+    PredictiveTrigger,
+    SpeculativeSlot,
     TaskRegistry,
     Urgency,
     classify_urgency,
@@ -136,6 +138,19 @@ def test_heuristic_confidence_very_short_reference_is_penalized():
 def test_heuristic_confidence_zero_timeout_does_not_crash():
     score = ConfidenceScore.heuristic_from_llm_reference("some answer text", elapsed_seconds=0.0, timeout_seconds=0.0)
     assert 0.0 <= score.strength() <= 1.0
+
+
+def test_confidence_scaled_only_discounts_confidence_axis():
+    score = ConfidenceScore(relevance=0.8, confidence=1.0, freshness=0.9)
+    discounted = score.scaled(0.5)
+    assert discounted.relevance == 0.8
+    assert discounted.freshness == 0.9
+    assert discounted.confidence == pytest.approx(0.5)
+
+
+def test_confidence_scaled_reduces_strength():
+    score = ConfidenceScore(relevance=1.0, confidence=1.0, freshness=1.0)
+    assert score.scaled(0.6).strength() < score.strength()
 
 
 def test_confidence_geometric_mean_penalizes_one_weak_axis_more_than_arithmetic_mean():
@@ -315,5 +330,176 @@ def test_sidecar_dispatch_to_unknown_service_reports_none():
         await asyncio.sleep(0.05)
 
         assert results == [None]
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# PredictiveTrigger (heuristic knowledge-need detector)
+# ---------------------------------------------------------------------------
+
+
+def test_predictive_trigger_fires_on_question_word():
+    trigger = PredictiveTrigger()
+    assert trigger.should_fire("who is the current CEO") is True
+
+
+def test_predictive_trigger_fires_on_trailing_question_mark():
+    trigger = PredictiveTrigger()
+    assert trigger.should_fire("so is that actually true?") is True
+
+
+def test_predictive_trigger_fires_on_info_phrase():
+    trigger = PredictiveTrigger()
+    assert trigger.should_fire("hey can you tell me about") is True
+
+
+def test_predictive_trigger_does_not_fire_on_small_talk():
+    trigger = PredictiveTrigger()
+    assert trigger.should_fire("yeah that sounds great honestly") is False
+
+
+def test_predictive_trigger_requires_minimum_words():
+    trigger = PredictiveTrigger(min_words=3)
+    assert trigger.should_fire("who is") is False  # too short even though "who" is a question word
+
+
+def test_predictive_trigger_only_fires_once_until_reset():
+    trigger = PredictiveTrigger()
+    assert trigger.should_fire("who is the current CEO") is True
+    assert trigger.should_fire("who is the current CEO of NVIDIA") is False  # already fired this turn
+
+    trigger.reset()
+    assert trigger.should_fire("who is the current CEO of NVIDIA") is True
+
+
+def test_predictive_trigger_ignores_empty_text():
+    trigger = PredictiveTrigger()
+    assert trigger.should_fire("") is False
+    assert trigger.should_fire("   ") is False
+
+
+# ---------------------------------------------------------------------------
+# SpeculativeSlot (reuse-on-confirm scheduling primitive)
+# ---------------------------------------------------------------------------
+
+
+def test_speculative_slot_start_reports_started():
+    async def run():
+        async with asyncio.TaskGroup() as tg:
+            slot = SpeculativeSlot()
+            started = slot.start(tg, lambda: asyncio.sleep(0, result="value"))
+            assert started is True
+            assert slot.has_attempt() is True
+            result = await slot.confirm()
+            assert result == "value"
+            assert slot.has_attempt() is False
+
+    asyncio.run(run())
+
+
+def test_speculative_slot_second_start_is_ignored_while_pending():
+    async def run():
+        async with asyncio.TaskGroup() as tg:
+            slot = SpeculativeSlot()
+            calls = []
+
+            async def factory():
+                calls.append(1)
+                await asyncio.sleep(0.05)
+                return "first"
+
+            assert slot.start(tg, factory) is True
+            assert slot.start(tg, factory) is False  # already has an attempt in flight
+            await slot.confirm()
+            assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+def test_speculative_slot_confirm_with_no_attempt_returns_none():
+    async def run():
+        slot = SpeculativeSlot()
+        assert await slot.confirm() is None
+
+    asyncio.run(run())
+
+
+def test_speculative_slot_confirm_awaits_still_running_task():
+    async def run():
+        async with asyncio.TaskGroup() as tg:
+            slot = SpeculativeSlot()
+
+            async def slow():
+                await asyncio.sleep(0.05)
+                return "done"
+
+            slot.start(tg, slow)
+            # confirm() is called immediately, before the task finishes.
+            result = await slot.confirm()
+            assert result == "done"
+
+    asyncio.run(run())
+
+
+def test_speculative_slot_confirm_returns_none_on_exception():
+    async def run():
+        async with asyncio.TaskGroup() as tg:
+            slot = SpeculativeSlot()
+            done = asyncio.Event()
+
+            async def failing():
+                try:
+                    raise RuntimeError("boom")
+                finally:
+                    done.set()
+
+            # Run in a plain Task outside the TaskGroup so the exception doesn't
+            # propagate and fail the group; SpeculativeSlot itself is TaskGroup-agnostic.
+            slot._task = asyncio.ensure_future(failing())
+            with pytest.raises(RuntimeError):
+                await slot._task
+            result = await slot.confirm()
+            assert result is None
+
+    asyncio.run(run())
+
+
+def test_speculative_slot_clear_cancels_without_confirming():
+    async def run():
+        async with asyncio.TaskGroup() as tg:
+            slot = SpeculativeSlot()
+
+            async def slow():
+                await asyncio.sleep(10)
+                return "should not get here"
+
+            slot.start(tg, slow)
+            slot.clear()
+            assert slot.has_attempt() is False
+            # Let the cancellation actually propagate before the TaskGroup exits.
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_speculative_slot_cancel_and_clear_awaits_cancellation():
+    async def run():
+        async with asyncio.TaskGroup() as tg:
+            slot = SpeculativeSlot()
+            cancelled = asyncio.Event()
+
+            async def slow():
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            slot.start(tg, slow)
+            await asyncio.sleep(0)  # let the task actually start running before cancelling it
+            await slot.cancel_and_clear()
+            assert cancelled.is_set()
+            assert slot.has_attempt() is False
 
     asyncio.run(run())

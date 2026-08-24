@@ -45,7 +45,7 @@ text present or not"?
 | # | Task | Approach | Files |
 |---|---|---|---|
 | 1.1 ✅🧪 | Confidence-aware conditioning strength | Scale the `streaming_sum` tensor by `f(relevance, confidence, freshness)` before injection, instead of injecting at fixed strength whenever retrieval succeeds | `cognitive/confidence.py`, `channel.py::_async_update_reference`, `inference_job.py` |
-| 1.2 | Predictive/speculative retrieval | Start a retrieval as soon as the transcript looks like it's heading toward a knowledge need (heuristic first: named entity / question-word detector on the streaming ASR transcript; embedding-similarity trigger later), racing it against the model's own `rag_token_id` emission — first one to a usable result wins, the other is cancelled via the task registry | `cognitive/predictive_trigger.py` (new), `turn_manager.py` |
+| 1.2 ✅🧪 | Predictive/speculative retrieval | Start a retrieval as soon as the transcript looks like it's heading toward a knowledge need (heuristic first: named entity / question-word detector on the streaming ASR transcript; embedding-similarity trigger later), racing it against the model's own `rag_token_id` emission — first one to a usable result wins, the other is cancelled via the task registry | `cognitive/predictive_trigger.py`, `cognitive/speculation.py`, `rag_manager.py`, `channel.py` |
 | 1.3 | Dynamic (multi-shot) conditioning | Today one reference → one conditioning tensor → whole response. Extend `RAGManager` to accept a follow-up retrieval mid-response (second `rag_token_id`, or the predictive trigger firing again) and push a second tensor through the *existing* per-slot streaming update path — the plumbing (`update_streaming_sum_tensors` accepts a fresh tensor per slot at any time) already supports this; what's missing is deciding *when* a second retrieval is worth the interruption | `rag_manager.py`, `cognitive/sidecar.py` |
 | 1.4 | Retrieval quality benchmark hook | Every retrieval logs `(query, reference_text, confidence, latency, applied: bool)` to a structured log the Phase 9 benchmark suite can replay | `cognitive/telemetry.py` |
 
@@ -65,6 +65,25 @@ entirely; otherwise the returned tensor is scaled by `strength()` before
 real relevance signal) — real embedding-similarity relevance scoring is the next
 increment, not this one. Tensor-scaling path is BLOCKED for execution here (no
 torch/GPU); the scoring function itself has 10 new unit tests.
+
+**1.2 status:** implemented. `cognitive/predictive_trigger.py::PredictiveTrigger`
+watches the partial ASR transcript for the current user turn (question words,
+trailing "?", a handful of info-request phrases) and fires at most once per turn.
+`channel.py::_stt_recv_loop` calls it after every `STTWordMessage` and, on a hit,
+calls the new `RAGManager.trigger_speculative` — which no-ops if a confirmed
+retrieval is already running (a guess never preempts real work) and otherwise
+starts the same `get_reference_text` call the confirmed path uses, applying its
+result early at a discounted confidence (`ConfidenceScore.scaled`, 0.6x). The
+reuse half of the mechanism lives in `cognitive/speculation.py::SpeculativeSlot`:
+when the model's own `rag_token_id` later fires, `RAGManager.trigger` adopts the
+speculative attempt (awaiting it if still running) instead of starting a second,
+redundant retrieval, and re-applies it at full (undiscounted) confidence. A new
+user turn (detected via the turn-manager's speaker-switch marker) clears any
+stale, never-confirmed speculative attempt so it can't block the next guess.
+16 new unit tests (`PredictiveTrigger`, `SpeculativeSlot`) — all torch-free, all
+passing (40/40 total in `test_cognitive.py`). `rag_manager.py`/`channel.py`
+wiring itself is BLOCKED for execution here (needs torch + openai + a running
+server), same as the rest of the RAG path.
 
 ---
 

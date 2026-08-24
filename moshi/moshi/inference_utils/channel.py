@@ -38,6 +38,7 @@ from aiohttp import web
 from .audio_processor import AudioProcessor
 from .rag_manager import RAGManager
 from ..cognitive.confidence import ConfidenceScore
+from ..cognitive.predictive_trigger import PredictiveTrigger
 from .turn_manager import TurnManager
 from .utils import get_conditioning_remote_async
 from ..stt import GradiumSpeechToText, LocalSpeechToText, STTWordMessage
@@ -121,6 +122,10 @@ class Channel:
         # Monotonically increasing id, bumped on every RAG trigger. Used to drop a
         # reference encoding that finishes after a newer trigger has superseded it.
         self._rag_seq: int = 0
+        # Predictive retrieval (PHASES.md Phase 1.2): fires before rag_token_id, from
+        # the partial ASR transcript of the user's current turn.
+        self.predictive_trigger = PredictiveTrigger()
+        self._current_user_utterance: str = ""
 
     async def __aenter__(self) -> "Channel":
         self._stack = contextlib.AsyncExitStack()
@@ -382,10 +387,44 @@ class Channel:
 
         raise _ChannelClosed()
 
+    def _bind_reference_handler(self):
+        """Mint a fresh ``trigger_seq`` and return a handler bound to it, shared by
+        the confirmed (rag_token_id) and speculative (predictive) trigger sites so
+        both go through the same staleness check in ``_async_update_reference``."""
+        self._rag_seq += 1
+        seq = self._rag_seq
+
+        async def _handle_reference_fn(reference_text, lm_label="", confidence=None, _seq=seq):
+            await self._handle_reference_text(reference_text, lm_label, trigger_seq=_seq, confidence=confidence)
+
+        return _handle_reference_fn
+
     async def _stt_recv_loop(self):
         async for msg in self.stt:
             if isinstance(msg, STTWordMessage):
-                await self._send_turn_outputs(self.turn_manager.handle_spoken_text(user_text=msg.text))
+                outputs = self.turn_manager.handle_spoken_text(user_text=msg.text)
+                if any(role == "user" and text.startswith("\n") for text, role in outputs):
+                    # A new user turn just started: drop any stale, never-confirmed
+                    # speculative attempt from the prior turn and re-arm the trigger.
+                    self._current_user_utterance = ""
+                    self.predictive_trigger.reset()
+                    self.rag_manager.clear_speculative()
+                await self._send_turn_outputs(outputs)
+
+                if self.turn_manager.active_speaker == "user":
+                    self._current_user_utterance += msg.text
+                    if self.predictive_trigger.should_fire(self._current_user_utterance):
+                        self._log.info(
+                            f"[RAG] predictive trigger fired on partial transcript: "
+                            f"'{self._current_user_utterance.strip()}'"
+                        )
+                        self.server.metrics.increment("rag_speculative_triggers_total")
+                        assert self._task_group is not None
+                        await self.rag_manager.trigger_speculative(
+                            task_group=self._task_group,
+                            handle_reference_fn=self._bind_reference_handler(),
+                            context_provider=self.turn_manager.get_context,
+                        )
 
     async def _output_loop(self):
         """Consume model outputs from the batched step loop and forward to the client."""
@@ -405,17 +444,11 @@ class Channel:
                 assert self._task_group is not None
                 await self._send_turn_outputs([("[RET]", "model")])
                 await self.stt.flush()
-                self._rag_seq += 1
-                trigger_seq = self._rag_seq
                 self.server.metrics.increment("rag_triggers_total")
-
-                async def _handle_reference_fn(reference_text, lm_label="", confidence=None, _seq=trigger_seq):
-                    await self._handle_reference_text(reference_text, lm_label, trigger_seq=_seq, confidence=confidence)
-
                 await self.rag_manager.trigger(
                     task_group=self._task_group,
                     wait_steps=self.server.stt_wait_steps,
-                    handle_reference_fn=_handle_reference_fn,
+                    handle_reference_fn=self._bind_reference_handler(),
                     context_provider=self.turn_manager.get_context,
                 )
             else:

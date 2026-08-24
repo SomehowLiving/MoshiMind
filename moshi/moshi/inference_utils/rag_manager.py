@@ -15,10 +15,15 @@ import time
 from typing import Awaitable, Callable
 import logging
 from ..cognitive.confidence import ConfidenceScore
+from ..cognitive.speculation import SpeculativeSlot
 from ..reference import LLMReferenceGenerator
 from ..reference.llm_reference_generator import ReferenceHistory
 
 logger = logging.getLogger(__name__)
+
+# How much to discount a speculative (unconfirmed) reference's trust before applying
+# it, relative to the same reference once the real rag_token_id trigger confirms it.
+_SPECULATIVE_CONFIDENCE_DISCOUNT = 0.6
 
 
 class RAGManager:
@@ -41,12 +46,14 @@ class RAGManager:
         self._wait_steps_remaining: int = 0
         self._wait_event: asyncio.Event | None = None
         self._pending_task: asyncio.Task | None = None
+        self._speculative = SpeculativeSlot()
         self._stack: contextlib.AsyncExitStack | None = None
         self._active_profile_id: str | None = None
 
     async def __aenter__(self) -> "RAGManager":
         self._stack = contextlib.AsyncExitStack()
         await self._stack.__aenter__()
+        self._stack.push_async_callback(self._speculative.cancel_and_clear)
         self._stack.push_async_callback(self._cancel_and_await_pending)
         return self
 
@@ -121,11 +128,22 @@ class RAGManager:
         handle_reference_fn: Callable[..., Awaitable[None]] | None = None,
         context_provider: Callable[[], str] | None = None,
     ):
-        """Trigger reference text generation in background."""
+        """Trigger reference text generation in background (the confirmed rag_token_id path).
+
+        If a speculative retrieval (``trigger_speculative``) is already in flight or has
+        already completed for this turn, adopt it instead of paying for retrieval twice.
+        """
         if self._stack is None:
             raise RuntimeError("RAGManager.trigger called outside of `async with` scope")
 
         await self._cancel_and_await_pending()
+
+        if self._speculative.has_attempt():
+            logger.info("[Reference] confirming trigger: reusing speculative retrieval")
+            self._pending_task = task_group.create_task(
+                self._confirm_speculative(wait_steps, handle_reference_fn, context_provider)
+            )
+            return
 
         if wait_steps > 0:
             self._wait_steps_remaining = wait_steps
@@ -136,6 +154,85 @@ class RAGManager:
             self._wait_steps_remaining = 0
 
         self._pending_task = task_group.create_task(self._background_task(handle_reference_fn, context_provider))
+
+    async def _confirm_speculative(
+        self,
+        wait_steps: int,
+        handle_reference_fn: Callable[..., Awaitable[None]] | None,
+        context_provider: Callable[[], str] | None,
+    ):
+        """Adopt an in-flight/completed speculative attempt; fall back to a fresh
+        retrieval if it produced nothing usable (still cheaper than never having tried)."""
+        try:
+            result = await self._speculative.confirm()
+        except asyncio.CancelledError:
+            logger.info("[Reference] speculative confirmation cancelled")
+            raise
+
+        if result is not None and result[0]:
+            reference_text, lm_label, confidence = result
+            if self.metrics is not None:
+                self.metrics.increment("rag_speculative_confirmed_total")
+            logger.info(f"[Reference] speculative retrieval confirmed (strength={confidence.strength():.2f})")
+            if handle_reference_fn is not None:
+                await handle_reference_fn(reference_text, lm_label, confidence=confidence)
+            return
+
+        logger.info("[Reference] speculative attempt produced nothing usable; falling back to fresh retrieval")
+        if self.metrics is not None:
+            self.metrics.increment("rag_speculative_miss_total")
+        if wait_steps > 0:
+            self._wait_steps_remaining = wait_steps
+            self._wait_event = asyncio.Event()
+        else:
+            self._wait_event = None
+            self._wait_steps_remaining = 0
+        await self._background_task(handle_reference_fn, context_provider)
+
+    async def trigger_speculative(
+        self,
+        task_group: asyncio.TaskGroup,
+        handle_reference_fn: Callable[..., Awaitable[None]] | None = None,
+        context_provider: Callable[[], str] | None = None,
+        confidence_discount: float = _SPECULATIVE_CONFIDENCE_DISCOUNT,
+    ):
+        """Start a retrieval before Moshi's own ``rag_token_id`` fires, from a heuristic
+        guess (see ``cognitive.predictive_trigger``) that one will be needed soon.
+
+        No-op if a confirmed retrieval is already in flight (never let a guess preempt
+        real work) or if a speculative attempt is already running/pending confirmation
+        for this turn.
+        """
+        if self._stack is None:
+            raise RuntimeError("RAGManager.trigger_speculative called outside of `async with` scope")
+        if self._pending_task is not None and not self._pending_task.done():
+            logger.info("[Reference] skipping speculative trigger: a confirmed retrieval is already in flight")
+            return
+        if self._speculative.has_attempt():
+            return
+
+        async def _run():
+            context = context_provider() if context_provider is not None else ""
+            _, reference_text, _, lm_label, confidence = await self.get_reference_text(context)
+            if reference_text and handle_reference_fn is not None:
+                provisional = confidence.scaled(confidence_discount)
+                logger.info(
+                    f"[Reference] applying provisional speculative reference "
+                    f"(strength={provisional.strength():.2f}, pending confirmation)"
+                )
+                await handle_reference_fn(reference_text, lm_label, confidence=provisional)
+            return reference_text, lm_label, confidence
+
+        started = self._speculative.start(task_group, _run)
+        if started:
+            logger.info("[Reference] started speculative retrieval ahead of rag_token_id")
+            if self.metrics is not None:
+                self.metrics.increment("rag_speculative_started_total")
+
+    def clear_speculative(self):
+        """Drop any speculative attempt without adopting it — call when a new user
+        turn starts so a stale, never-confirmed guess doesn't block the next one."""
+        self._speculative.clear()
 
     async def _background_task(
         self,
@@ -181,6 +278,7 @@ class RAGManager:
     def reset(self, gt_reference_text: str | None = None):
         """Reset RAG manager state."""
         self.cancel_pending()
+        self.clear_speculative()
         self._wait_steps_remaining = 0
         self._wait_event = None
         self.gt_reference_text = gt_reference_text

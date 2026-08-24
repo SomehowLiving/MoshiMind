@@ -51,6 +51,15 @@ class ConfidenceScore:
         object.__setattr__(self, "confidence", _clamp01(self.confidence))
         object.__setattr__(self, "freshness", _clamp01(self.freshness))
 
+    def scaled(self, factor: float) -> "ConfidenceScore":
+        """Apply an extra discount to ``confidence`` (not relevance/freshness).
+
+        Used to mark a speculatively-retrieved reference as provisional (PHASES.md
+        Phase 1.2): it might be trusted enough to nudge generation a little before
+        the real trigger confirms it, but not as much as a confirmed retrieval.
+        """
+        return ConfidenceScore(relevance=self.relevance, confidence=self.confidence * factor, freshness=self.freshness)
+
     def strength(self) -> float:
         """Conditioning-bias multiplier in ``[0, 1]``.
 
