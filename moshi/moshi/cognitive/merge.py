@@ -57,3 +57,29 @@ def merge_candidates(candidates: list[KnowledgeCandidate], max_chars: int = 800)
         total_chars += addition_len
 
     return KnowledgeCandidate(source="+".join(sources), text=" ".join(parts), confidence=usable[0].confidence)
+
+
+def resolve_reference_conditioning(
+    reference_text: str,
+    lm_label: str,
+    confidence: ConfidenceScore | None,
+    memory_candidate: KnowledgeCandidate | None,
+) -> tuple[str, str, ConfidenceScore]:
+    """The exact decision ``channel.py::_bind_reference_handler`` makes once RAG's own
+    retrieval has completed and a (possibly ``None``) memory candidate is in hand.
+
+    Factored out as a pure function so this decision is unit-testable without
+    importing ``channel.py`` (which requires torch to import at all, unavailable in
+    this environment — see the repo's execution audit): merge RAG's result with
+    memory when memory has something usable, otherwise fall back to RAG's own
+    result completely unchanged (including its empty-string/failure case, which
+    ``channel.py`` uses as the signal to show ``[RET_FAILED]``).
+    """
+    rag_candidate = KnowledgeCandidate(
+        source=lm_label or "rag", text=reference_text or "", confidence=confidence or ConfidenceScore()
+    )
+    candidates = [rag_candidate] + ([memory_candidate] if memory_candidate is not None else [])
+    merged = merge_candidates(candidates)
+    if merged is not None:
+        return merged.text, (lm_label or merged.source), merged.confidence
+    return reference_text, lm_label, confidence or ConfidenceScore.empty()

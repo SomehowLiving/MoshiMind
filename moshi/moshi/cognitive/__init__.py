@@ -23,7 +23,7 @@ from .multishot import MultiShotGate
 from .telemetry import RetrievalEvent, RetrievalTelemetry
 from .rag_service import RAGCognitiveService
 from .tools.calculator import CalculatorService, evaluate_arithmetic, UnsafeExpressionError
-from .merge import KnowledgeCandidate, merge_candidates
+from .merge import KnowledgeCandidate, merge_candidates, resolve_reference_conditioning
 from .memory import MemoryStore, EpisodicRecord, SemanticFact, WorkingMemory, score_salience, extract_facts, MemoryCognitiveService
 
 __all__ = [
@@ -47,6 +47,7 @@ __all__ = [
     "UnsafeExpressionError",
     "KnowledgeCandidate",
     "merge_candidates",
+    "resolve_reference_conditioning",
     "MemoryStore",
     "EpisodicRecord",
     "SemanticFact",

@@ -29,6 +29,8 @@ from .inference_utils.utils import get_reference_encoder_url, seed_all, setup_lo
 from .inference_utils.channel import Channel, StepOutput
 from .inference_utils.retrieval_profiles import default_profile_id, load_retrieval_env
 from .cognitive.telemetry import RetrievalTelemetry
+from .cognitive.sidecar import CognitiveSidecar
+from .cognitive.memory import MemoryStore, MemoryCognitiveService
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,9 @@ class ServerState:
         vad_window_size: int = 4,
         vad_threshold: float = 0.5,
         init_active_speaker: str = "model",
+        memory_db_path: str = ":memory:",
+        memory_lookup_deadline: float = 0.2,
+        memory_salience_threshold: float = 0.5,
     ):
         self.text_tokenizer = text_tokenizer
         self.reference_encoder_url = reference_encoder_url
@@ -125,6 +130,11 @@ class ServerState:
         self.rag_shot_cooldown_seconds = rag_shot_cooldown_seconds
         self.metrics = Metrics()
         self.retrieval_telemetry = RetrievalTelemetry()
+        self.memory_lookup_deadline = memory_lookup_deadline
+        self.memory_salience_threshold = memory_salience_threshold
+        self.memory_store = MemoryStore(db_path=memory_db_path)
+        self.cognitive_sidecar = CognitiveSidecar()
+        self.cognitive_sidecar.register(MemoryCognitiveService(self.memory_store))
         self.max_reference_tokens = max_reference_tokens
         self.vad_window_size = vad_window_size
         self.vad_threshold = vad_threshold
@@ -370,6 +380,27 @@ def main():
         help="Minimum time between confirmed RAG triggers within one model response (default: 2.0).",
     )
     parser.add_argument(
+        "--memory-db-path",
+        type=str,
+        default=":memory:",
+        help=(
+            "SQLite path for long-term memory (PHASES.md Phase 3). Default ':memory:' "
+            "does not persist across restarts; pass a file path for real durability."
+        ),
+    )
+    parser.add_argument(
+        "--memory-lookup-deadline",
+        type=float,
+        default=0.2,
+        help="Max seconds to wait for a memory lookup before continuing without it (default: 0.2).",
+    )
+    parser.add_argument(
+        "--memory-salience-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum salience score (0-1) for a user turn to be persisted as an episodic memory (default: 0.5).",
+    )
+    parser.add_argument(
         "--max-reference-tokens",
         type=int,
         default=512,
@@ -459,6 +490,9 @@ def main():
         rag_min_conditioning_strength=args.rag_min_conditioning_strength,
         rag_max_shots_per_turn=args.rag_max_shots_per_turn,
         rag_shot_cooldown_seconds=args.rag_shot_cooldown_seconds,
+        memory_db_path=args.memory_db_path,
+        memory_lookup_deadline=args.memory_lookup_deadline,
+        memory_salience_threshold=args.memory_salience_threshold,
         max_reference_tokens=args.max_reference_tokens,
         batch_size=args.batch_size,
         vad_window_size=args.vad_window_size,
@@ -489,6 +523,17 @@ def main():
         return web.json_response(state.retrieval_telemetry.snapshot())
 
     app.router.add_get("/api/retrieval_telemetry", handle_retrieval_telemetry)
+
+    async def handle_memory_facts(request: web.Request) -> web.Response:
+        """GET /api/memory/{user_id}: known semantic facts for a memory user id
+        (PHASES.md Phase 3) — inspection/debugging only, not authenticated."""
+        user_id = request.match_info["user_id"]
+        facts = state.memory_store.get_facts(user_id)
+        return web.json_response(
+            [{"key": f.key, "value": f.value, "confidence": f.confidence, "updated_at": f.updated_at} for f in facts]
+        )
+
+    app.router.add_get("/api/memory/{user_id}", handle_memory_facts)
 
     async def handle_session_feedback(request: web.Request) -> web.Response:
         """

@@ -25,6 +25,7 @@ from moshi.cognitive import (
     WorkingMemory,
     extract_facts,
     merge_candidates,
+    resolve_reference_conditioning,
     score_salience,
 )
 
@@ -330,3 +331,57 @@ def test_merge_ranks_by_strength_not_input_order():
     strong = KnowledgeCandidate("rag", "strong", ConfidenceScore(1.0, 1.0, 1.0))
     merged = merge_candidates([weak, strong], max_chars=1000)
     assert merged.text == "strong weak"  # strongest first regardless of input order
+
+
+# ---------------------------------------------------------------------------
+# resolve_reference_conditioning (the exact decision channel.py's live wiring
+# makes once RAG's own retrieval completes and a memory candidate is in hand)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_rag_only_no_memory_candidate():
+    text, label, confidence = resolve_reference_conditioning(
+        "NVIDIA's CEO is Jensen Huang.", "gpt-4", ConfidenceScore(0.9, 0.9, 0.9), None
+    )
+    assert text == "NVIDIA's CEO is Jensen Huang."
+    assert label == "gpt-4"
+    assert confidence.strength() > 0
+
+
+def test_resolve_merges_rag_and_memory():
+    memory = KnowledgeCandidate("memory", "Known about the user: name=Nidhi", ConfidenceScore(0.8, 0.9, 1.0))
+    text, label, confidence = resolve_reference_conditioning(
+        "NVIDIA's CEO is Jensen Huang.", "gpt-4", ConfidenceScore(0.9, 0.9, 0.9), memory
+    )
+    assert "Jensen Huang" in text
+    assert "Nidhi" in text
+
+
+def test_resolve_falls_back_to_memory_when_rag_produced_nothing():
+    """If the retrieval LLM times out/fails but memory has something, the user still
+    gets grounded (in what's known about them) instead of nothing at all."""
+    memory = KnowledgeCandidate("memory", "Known about the user: occupation=engineer", ConfidenceScore(0.8, 0.9, 1.0))
+    text, label, confidence = resolve_reference_conditioning("", "", ConfidenceScore.empty(), memory)
+    assert "engineer" in text
+    assert confidence.strength() > 0
+
+
+def test_resolve_rag_failure_with_no_memory_falls_through_to_ret_failed_case():
+    """Empty RAG result and no memory candidate must round-trip as empty text with
+    empty confidence -- that's what channel.py uses to decide to show [RET_FAILED]."""
+    text, label, confidence = resolve_reference_conditioning("", "", ConfidenceScore.empty(), None)
+    assert text == ""
+    assert confidence.strength() == 0.0
+
+
+def test_resolve_rag_failure_with_unusable_memory_also_falls_through():
+    unusable_memory = KnowledgeCandidate("memory", "", ConfidenceScore.empty())
+    text, label, confidence = resolve_reference_conditioning("", "", ConfidenceScore.empty(), unusable_memory)
+    assert text == ""
+    assert confidence.strength() == 0.0
+
+
+def test_resolve_preserves_lm_label_when_merge_happens():
+    memory = KnowledgeCandidate("memory", "some fact", ConfidenceScore(0.5, 0.9, 1.0))
+    _, label, _ = resolve_reference_conditioning("a fact", "claude-3", ConfidenceScore(0.9, 0.9, 0.9), memory)
+    assert label == "claude-3"  # the LLM display name, not the merged source string

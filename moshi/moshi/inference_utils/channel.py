@@ -26,6 +26,7 @@ import contextlib
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 
 import aiohttp
@@ -38,8 +39,12 @@ from aiohttp import web
 from .audio_processor import AudioProcessor
 from .rag_manager import RAGManager
 from ..cognitive.confidence import ConfidenceScore
+from ..cognitive.merge import KnowledgeCandidate, resolve_reference_conditioning
+from ..cognitive.memory import extract_facts, score_salience
 from ..cognitive.multishot import MultiShotGate
 from ..cognitive.predictive_trigger import PredictiveTrigger
+from ..cognitive.sidecar import CognitiveRequest
+from ..cognitive.urgency import Urgency
 from .turn_manager import TurnManager
 from .utils import get_conditioning_remote_async
 from ..stt import GradiumSpeechToText, LocalSpeechToText, STTWordMessage
@@ -128,6 +133,12 @@ class Channel:
         # the partial ASR transcript of the user's current turn.
         self.predictive_trigger = PredictiveTrigger()
         self._current_user_utterance: str = ""
+        self._turn_index: int = 0
+        # Memory identity (PHASES.md Phase 3): this repo has no authentication layer
+        # (see the execution audit), so there is no real "same user across sessions"
+        # concept yet -- per-connection is the best available id, which makes memory
+        # effectively per-conversation until a real identity system exists.
+        self.conversation_id: str = str(uuid.uuid4())
         # Bounds confirmed rag_token_id triggers per model response (Phase 1.3):
         # repeated triggers in quick succession are as likely to be looping/uncertainty
         # as N genuinely distinct information needs.
@@ -396,17 +407,77 @@ class Channel:
 
         raise _ChannelClosed()
 
-    def _bind_reference_handler(self):
+    def _bind_reference_handler(self, memory_task: "asyncio.Task[KnowledgeCandidate | None] | None" = None):
         """Mint a fresh ``trigger_seq`` and return a handler bound to it, shared by
         the confirmed (rag_token_id) and speculative (predictive) trigger sites so
-        both go through the same staleness check in ``_async_update_reference``."""
+        both go through the same staleness check in ``_async_update_reference``.
+
+        ``memory_task``, if given, is a memory lookup already dispatched concurrently
+        with RAG (PHASES.md Phase 3.4) — RAG answers "what does the world know",
+        memory answers "what does this user know", and both compete for the same
+        conditioning channel via ``cognitive.merge.merge_candidates``. It is awaited
+        here, inside the handler that only ever runs once RAG's own retrieval has
+        completed -- never inline in ``_output_loop``/``_stt_recv_loop`` -- so a slow
+        memory lookup cannot add latency to the audio-frame critical path; by the time
+        this runs, a local sqlite lookup has almost certainly already finished, since
+        it started at the same moment as (and is far cheaper than) RAG's network call.
+        """
         self._rag_seq += 1
         seq = self._rag_seq
 
-        async def _handle_reference_fn(reference_text, lm_label="", confidence=None, _seq=seq):
-            await self._handle_reference_text(reference_text, lm_label, trigger_seq=_seq, confidence=confidence)
+        async def _handle_reference_fn(reference_text, lm_label="", confidence=None, _seq=seq, _memory_task=memory_task):
+            memory_candidate = None
+            if _memory_task is not None:
+                try:
+                    memory_candidate = await _memory_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._log.warning(f"[Memory] lookup failed: {e}")
+
+            text, label, resolved_confidence = resolve_reference_conditioning(
+                reference_text, lm_label, confidence, memory_candidate
+            )
+            await self._handle_reference_text(text, label, trigger_seq=_seq, confidence=resolved_confidence)
 
         return _handle_reference_fn
+
+    async def _lookup_memory(self, context: str) -> KnowledgeCandidate | None:
+        """Fetch known facts/relevant episodes for this conversation, bounded by
+        ``--memory-lookup-deadline`` (default 0.2s) so a slow lookup never meaningfully
+        delays triggering RAG. Returns ``None`` on timeout/failure/nothing-known —
+        callers treat that exactly like "no memory candidate" for merge purposes.
+        """
+        # CRITICAL here doesn't mean "block Moshi" -- callers already isolate this
+        # await inside its own task (see the memory_task call sites), never inline in
+        # _output_loop/_stt_recv_loop. It means "we want a fast, bounded answer",
+        # which is also what suppresses dispatch_and_wait's non-critical-usage warning.
+        request = CognitiveRequest(
+            query=context,
+            context=self.conversation_id,
+            urgency=Urgency.CRITICAL,
+            deadline=self.server.memory_lookup_deadline,
+        )
+        result = await self.server.cognitive_sidecar.dispatch_and_wait(self.conversation_id, "memory", request)
+        if result is None or not result.text:
+            return None
+        return KnowledgeCandidate(source=result.source or "memory", text=result.text, confidence=result.confidence)
+
+    def _commit_user_utterance_to_memory(self) -> None:
+        """Extract durable facts and (if salient enough) an episodic record from the
+        just-completed user utterance (PHASES.md Phase 3.2/3.3). Called when the model
+        starts a new response, i.e. right after the user's turn has ended -- see the
+        ``_output_loop`` call site.
+        """
+        utterance = self._current_user_utterance.strip()
+        if not utterance:
+            return
+        now = time.time()
+        for key, value in extract_facts(utterance):
+            self.server.memory_store.upsert_fact(self.conversation_id, key, value, confidence=0.7, now=now)
+        salience = score_salience(utterance)
+        if salience >= self.server.memory_salience_threshold:
+            self.server.memory_store.add_episode(self.conversation_id, self._turn_index, utterance, salience, now)
 
     async def _stt_recv_loop(self):
         async for msg in self.stt:
@@ -416,6 +487,7 @@ class Channel:
                     # A new user turn just started: drop any stale, never-confirmed
                     # speculative attempt from the prior turn and re-arm the trigger.
                     self._current_user_utterance = ""
+                    self._turn_index += 1
                     self.predictive_trigger.reset()
                     self.rag_manager.clear_speculative()
                 await self._send_turn_outputs(outputs)
@@ -429,9 +501,12 @@ class Channel:
                         )
                         self.server.metrics.increment("rag_speculative_triggers_total")
                         assert self._task_group is not None
+                        memory_task = self._task_group.create_task(
+                            self._lookup_memory(self.turn_manager.get_context())
+                        )
                         await self.rag_manager.trigger_speculative(
                             task_group=self._task_group,
-                            handle_reference_fn=self._bind_reference_handler(),
+                            handle_reference_fn=self._bind_reference_handler(memory_task),
                             context_provider=self.turn_manager.get_context,
                         )
 
@@ -463,18 +538,22 @@ class Channel:
                     await self.stt.flush()
                     self.multishot_gate.record_shot(now)
                     self.server.metrics.increment("rag_triggers_total")
+                    memory_task = self._task_group.create_task(self._lookup_memory(self.turn_manager.get_context()))
                     await self.rag_manager.trigger(
                         task_group=self._task_group,
                         wait_steps=self.server.stt_wait_steps,
-                        handle_reference_fn=self._bind_reference_handler(),
+                        handle_reference_fn=self._bind_reference_handler(memory_task),
                         context_provider=self.turn_manager.get_context,
                     )
             else:
                 decoded = self._decode_text_token(text_token)
                 outputs = self.turn_manager.handle_spoken_text(model_text=decoded)
                 if any(role == "model" and text.startswith("\n") for text, role in outputs):
-                    # A new model response is starting: reset the per-response shot budget.
+                    # A new model response is starting, i.e. the user's turn just ended:
+                    # reset the per-response shot budget and commit what was just said
+                    # to memory before it's cleared for the next user turn.
                     self.multishot_gate.reset()
+                    self._commit_user_utterance_to_memory()
                 await self._send_turn_outputs(outputs)
 
             self.rag_manager.step()

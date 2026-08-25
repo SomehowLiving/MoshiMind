@@ -245,6 +245,45 @@ isolation, not about swapping out a working live conversation path.
 and a persistence round-trip test (write, close, reopen, read back). 113/113 total
 across `test_cognitive.py` + `test_memory.py`.
 
+**Live-wired, breaking the "prove it, wire it later" pattern for the first time**:
+this is the sidecar's and memory's first real integration into `channel.py`, not
+another isolated addition — `ServerState` now owns a `CognitiveSidecar` and a
+`MemoryStore`, with `MemoryCognitiveService` registered on it (`--memory-db-path`,
+default `:memory:`; `--memory-lookup-deadline`, default 0.2s; `--memory-salience-threshold`,
+default 0.5). At both RAG trigger sites (confirmed `rag_token_id` and speculative),
+`Channel` now:
+
+1. Dispatches a memory lookup as its own task (`task_group.create_task`, *not*
+   awaited inline) at the same moment RAG's own retrieval starts.
+2. Passes that task into `_bind_reference_handler`, which awaits it only inside the
+   handler that already runs once RAG's retrieval completes — never in
+   `_output_loop`/`_stt_recv_loop` directly. **This was a real mistake caught and
+   fixed during this session**: the first version awaited the memory lookup inline
+   before triggering RAG, which would have blocked subsequent audio-frame processing
+   in `_output_loop` for up to the full `--memory-lookup-deadline` (200ms) on every
+   single RAG trigger — a direct violation of the project's own "never destroy
+   Moshi's low-latency architecture" thesis. Since a local sqlite lookup is far
+   cheaper than RAG's network round trip, awaiting it after RAG completes costs
+   effectively nothing in practice.
+3. Merges RAG's result with the memory candidate via `cognitive.merge.resolve_reference_conditioning`
+   — a new pure function factored out of the handler specifically so this exact
+   decision (merge when memory has something; fall back to RAG's own result,
+   including its failure case, when it doesn't) is unit-testable without importing
+   `channel.py` (torch-gated, unavailable in this environment). 6 new tests cover it,
+   including the case where RAG fails entirely but memory still grounds the response.
+4. Commits the just-completed user utterance to memory (`extract_facts` → `upsert_fact`,
+   `score_salience` → `add_episode` if above threshold) the moment the model's next
+   response starts — i.e., right after the user's turn ends, reusing
+   `_current_user_utterance` (already accumulated for the Phase 1.2 predictive trigger).
+
+Also added `GET /api/memory/{user_id}` for inspection. This wiring itself remains
+**BLOCKED for execution** in this environment (torch/openai unavailable, per the
+execution audit) — the decision logic it depends on (`resolve_reference_conditioning`,
+`merge_candidates`, the memory store/extraction pipeline) is fully tested; the
+`asyncio.Task`-based non-blocking dispatch pattern is the same one already proven
+correct for the confirmed-vs-speculative RAG race in Phase 1.2. 6 new unit tests,
+119/119 total across `test_cognitive.py` + `test_memory.py`.
+
 ---
 
 ## Phase 4 — 🔴 Full-duplex interruption / anticipation
