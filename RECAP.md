@@ -1,5 +1,13 @@
 # MoshiMind — Session Recap & Continuation Guide
 
+**The machine you're running on has an NVIDIA GPU.** That's the single most
+important fact in this document: everything below was built on a machine with
+*no* GPU, no torch, and no openai/httpx installed, which made real execution of
+the torch-dependent code impossible and shaped how the work was done (see §2).
+You don't have that constraint. Your highest-value first move is almost certainly
+§6 item 1 — actually running the server and validating the live wiring for real,
+since that's the one category of work that was categorically impossible before now.
+
 **Purpose of this file:** you (a fresh Claude session, on a different machine, with
 zero memory of prior conversation) are picking up work on this repo. This document
 tells you what the project is, what's already been decided and built, what
@@ -283,20 +291,34 @@ Almost every phase above used the same discipline, and it's worth preserving:
 
 ## 6. Concrete next steps, in priority order
 
-1. **If you have a GPU + torch on this new machine: validate the live wiring for
-   real, first.** Nothing in Phases 1/3/4 has ever actually been executed — it's
-   been reasoned through and unit-tested at the decision-logic level only. Start
-   the server (`moshi-server-py` / `python -m moshi.server`, see `moshi/pyproject.toml`
-   `[project.scripts]`), have a real conversation, and check: does confidence-weighted
-   conditioning behave sanely? Does speculative retrieval actually fire and get
-   reused? Does the multishot gate actually cap repeated triggers? Does memory
-   actually get recalled? Does an interruption actually mute audio? Fix whatever
-   the real hardware surfaces — treat everything here as a well-reasoned hypothesis
-   until proven with actual generation.
-2. **Phase 4.3's remaining half**: hook the batched step loop
-   (`BatchRunner`/`LMGen`) so a `YIELD` decision actually stops the transformer
-   from computing more tokens for that slot, not just stops forwarding audio. This
-   needs a GPU to build and verify — don't attempt it without one.
+1. **Validate the live wiring for real, first — this machine has the GPU that
+   makes it possible.** Nothing in Phases 1/3/4 has ever actually been executed —
+   it's been reasoned through and unit-tested at the decision-logic level only.
+   Concretely:
+   - Install real dependencies (`pip install -e moshi/` or per `moshi/pyproject.toml`;
+     note the `requirements.txt`/`pyproject.toml` pin-drift was already fixed once
+     this session — check they're still in sync before trusting either blindly).
+   - Start the server (`moshi-server-py`, see `moshi/pyproject.toml`
+     `[project.scripts]`) with a real `LLM_BASE_URL`/`REFERENCE_ENCODER_URL`.
+   - Have a real conversation and check, one by one: does confidence-weighted
+     conditioning behave sanely (§3 Phase 1.1)? Does speculative retrieval actually
+     fire and get reused instead of double-retrieving (1.2)? Does the multishot
+     gate actually cap repeated triggers (1.3)? Does memory actually get recalled
+     and merged with RAG (Phase 3)? Does a real interruption actually mute audio
+     within a perceptible beat (Phase 4.3)? Does the prosody-based override ever
+     actually fire on real speech (5.1)?
+   - Fix whatever the real hardware surfaces. Treat every claim in `PHASES.md`'s
+     "implemented, live-wired" status notes as a well-reasoned hypothesis until
+     you've watched it happen against real generation — the unit tests prove the
+     decision logic is internally consistent, not that the integration is bug-free.
+2. **Phase 4.3's remaining half, now actually buildable**: hook the batched step
+   loop (`BatchRunner`/`LMGen` — see `moshi/moshi/inference_utils/batch_runner.py`
+   and `moshi/moshi/models/lm.py`) so a `YIELD` decision actually stops the
+   transformer from computing more tokens for that slot, not just stops forwarding
+   audio. This was explicitly *not* attempted without a GPU — you have one now, so
+   this is a real, unblocked next step, not a "someday." Go carefully: this loop is
+   shared across every concurrently connected channel's batch slot, so a bug here
+   has a much larger blast radius than anything built so far.
 3. **Phase 5.2**: thread `ProsodyTracker.energy_trend()`/`pitch_trend()` into
    `classify_urgency` (Phase 2.2) and `ConfidenceScore` (Phase 1.1) — e.g. a
    hesitant, declining-energy question gets a lower-confidence grounding pass.
