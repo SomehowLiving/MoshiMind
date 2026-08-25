@@ -50,6 +50,7 @@ from ..cognitive.merge import KnowledgeCandidate, resolve_reference_conditioning
 from ..cognitive.memory import extract_facts, score_salience
 from ..cognitive.multishot import MultiShotGate
 from ..cognitive.predictive_trigger import PredictiveTrigger
+from ..cognitive.prosody import ProsodyTracker
 from ..cognitive.sidecar import CognitiveRequest
 from ..cognitive.urgency import Urgency
 from .turn_manager import TurnManager
@@ -153,15 +154,25 @@ class Channel:
             max_shots_per_turn=server.rag_max_shots_per_turn,
             min_cooldown_seconds=server.rag_shot_cooldown_seconds,
         )
-        # Full-duplex interruption tracking (PHASES.md Phase 4.1/4.2). Detection and
-        # state-tracking only for now: actually cutting Moshi's in-flight audio
-        # generation on a barge-in (Phase 4.3) needs a hook into the batched step
-        # loop (BatchRunner/LMGen), which is GPU-only to build and verify safely --
-        # not attempted in this environment. This wiring computes and surfaces the
-        # classification/decision so that hook has something real to act on.
+        # Full-duplex interruption tracking (PHASES.md Phase 4.1/4.2/5.1). Classified
+        # from VAD + partial ASR words plus a real acoustic signal (energy trend, via
+        # ProsodyTracker over raw PCM -- not a trained model, see cognitive.prosody).
         self.conversation_state = ConversationState()
         self.interruption_classifier = InterruptionClassifier()
+        self.prosody_tracker = ProsodyTracker()
         self._overlap_utterance: str = ""
+        # Phase 4.3: on a confirmed barge-in, Moshi's audio to the client is muted
+        # immediately. This does NOT stop the underlying batched generation loop
+        # (BatchRunner/LMGen) -- that loop is shared across every concurrently
+        # connected channel's GPU batch slot, and altering its per-step behavior is
+        # GPU-only to build and verify safely, not attempted in this environment. What
+        # this DOES stop is what the user actually perceives: muting output is a
+        # legitimate interruption mechanism in Moshi's own full-duplex design, since
+        # the model is always listening to the user's live audio regardless of whose
+        # "turn" TurnManager thinks it is -- the user taking over is exactly what
+        # cutting the model's audio to them achieves, without touching shared state
+        # that could destabilize other channels sharing the same batch.
+        self._model_audio_muted: bool = False
 
     async def __aenter__(self) -> "Channel":
         self._stack = contextlib.AsyncExitStack()
@@ -405,6 +416,9 @@ class Channel:
             while buf.shape[-1] >= frame_size:
                 chunk_np = buf[:frame_size]
                 buf = buf[frame_size:]
+                # Real acoustic signal (PHASES.md Phase 5.1), fed frame-by-frame from
+                # the raw decoded PCM before it's converted to a tensor.
+                self.prosody_tracker.update(chunk_np, server.runner.mimi.sample_rate)
                 chunk = torch.from_numpy(chunk_np).to(device=server.device)[None, None]
 
                 try:
@@ -515,7 +529,10 @@ class Channel:
                     # active -- genuine full-duplex overlap (PHASES.md Phase 4.2).
                     self._overlap_utterance += msg.text
                     kind = self.interruption_classifier.classify(
-                        self._overlap_utterance, self.turn_manager.vad_history, self.turn_manager.threshold
+                        self._overlap_utterance,
+                        self.turn_manager.vad_history,
+                        self.turn_manager.threshold,
+                        energy_trend=self.prosody_tracker.energy_trend(),
                     )
                     if kind is not InterruptionKind.NONE:
                         self.conversation_state.note_overlap(kind)
@@ -525,12 +542,17 @@ class Channel:
                             f"overlap='{self._overlap_utterance.strip()}'"
                         )
                         self.server.metrics.increment(f"interruption_{kind.value}_total")
-                        if decision is InterruptionDecision.YIELD:
-                            # Detected and logged, not yet acted on: cutting live audio
-                            # generation needs a hook into the batched step loop
-                            # (BatchRunner/LMGen) that this environment can't safely
-                            # build or verify without a GPU -- see PHASES.md Phase 4.3.
-                            self.server.metrics.increment("interruption_barge_in_not_acted_total")
+                        if decision is InterruptionDecision.YIELD and not self._model_audio_muted:
+                            # Phase 4.3: cut what the user actually hears. This does not
+                            # stop the shared batched generation loop (see the __init__
+                            # comment on _model_audio_muted for why) -- it stops this
+                            # channel's audio bytes from reaching the client, which is
+                            # what "the model yields the floor" means from the user's
+                            # perspective in a full-duplex system that's always listening.
+                            self._model_audio_muted = True
+                            self.conversation_state.resolve_overlap_as_yield()
+                            await self._send_turn_outputs([("[INTERRUPTED]", "model")])
+                            self.server.metrics.increment("interruption_barge_in_cut_total")
 
                 if self.turn_manager.active_speaker == "user":
                     self._current_user_utterance += msg.text
@@ -558,8 +580,11 @@ class Channel:
 
             # Audio first (latency-critical for the user).
             if out.pcm is not None:
+                # Keep feeding the opus encoder regardless of mute state, so its
+                # internal state stays continuous -- only whether we forward the
+                # resulting bytes to the client depends on Phase 4.3's interruption cut.
                 opus_bytes = self.opus_writer.append_pcm(out.pcm.numpy())
-                if len(opus_bytes) > 0:
+                if len(opus_bytes) > 0 and not self._model_audio_muted:
                     await self.ws.send_bytes(b"\x01" + opus_bytes)
 
             # Text / RAG triggers.
@@ -596,6 +621,7 @@ class Channel:
                     self._commit_user_utterance_to_memory()
                     self._overlap_utterance = ""
                     self.conversation_state.begin_model_turn()
+                    self._model_audio_muted = False  # fresh response: audible again
                 await self._send_turn_outputs(outputs)
 
             self.rag_manager.step()

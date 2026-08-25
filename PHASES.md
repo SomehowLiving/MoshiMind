@@ -297,7 +297,7 @@ user hesitating, should Moshi yield) belong in the Moshi-facing layer.
 |---|---|---|
 | 4.1 | Formalize `ConversationState` (turn_id, speaking_state, interruption_state, user_confidence) referenced by later phases — currently implicit across `turn_manager.py`/`channel.py` | ✅🧪 |
 | 4.2 | Interruption classifier: barge-in vs. backchannel ("mhm", "right") vs. hesitation, from VAD + partial ASR words already available in `turn_manager.py` | ✅🧪 |
-| 4.3 | Mid-generation response change: when a real interruption is detected, cut generation and re-condition rather than finish-then-listen | 🔲 BLOCKED |
+| 4.3 | Mid-generation response change: when a real interruption is detected, cut generation and re-condition rather than finish-then-listen | ✅🧪 (output-level cut; see status) |
 
 **Acceptance:** 4.1/4.2 are pure state-machine logic, testable against recorded
 VAD/ASR event sequences without audio hardware. 4.3 requires the live generation loop
@@ -335,31 +335,76 @@ Moshi generates, so there was no reason to hold it back.
   while `TurnManager.active_speaker` still says `"model"` — literal full-duplex
   overlap — the classifier runs, `ConversationState.note_overlap` updates, the
   decision is logged, and `interruption_{kind}_total` metrics are incremented.
-- **4.3 explicitly not implemented, not just "not tested"**: a `YIELD` decision is
-  detected, logged, and counted (`interruption_barge_in_not_acted_total`) but the
-  model keeps talking regardless — actually cutting generation needs a hook into the
-  batched step loop (`BatchRunner`/`LMGen`), GPU-only to build and verify safely, and
-  risky to guess at blind. Better to surface a real, correct decision that isn't
-  acted on yet than to guess at step-loop surgery with no way to test it.
+- **4.3 update — implemented at the output level, deliberately not at the generation
+  level.** A `YIELD` decision now actually cuts what the user hears: `Channel` stops
+  forwarding this channel's Opus audio bytes to the client (`_model_audio_muted`,
+  gated in `_output_loop`) and sends an `[INTERRUPTED]` marker, immediately, the
+  moment a barge-in is classified. The opus encoder keeps being fed regardless of
+  mute state so its internal buffering stays continuous; only the websocket send is
+  gated. What this deliberately does *not* do is touch the shared batched generation
+  loop (`BatchRunner`/`LMGen`) — that loop is shared across every concurrently
+  connected channel's GPU batch slot, and altering its per-step behavior is GPU-only
+  to build and verify safely; a bug there risks every channel sharing the batch, not
+  just the one being interrupted. The justification for why an output-level cut is a
+  legitimate (not a compromise) interruption mechanism: Moshi's full-duplex design
+  means the model is *always* processing the user's live audio regardless of whose
+  turn `TurnManager` thinks it is — muting the model's audio to the user is exactly
+  what "yielding the floor" means from the user's actual experience, achieved without
+  any risk to shared state. Un-mutes automatically at the start of the model's next
+  response (`begin_model_turn()`).
+- **5.1 folded in here**: `cognitive/prosody.py` adds real acoustic signal —
+  autocorrelation-based pitch (F0) estimation and RMS energy over raw PCM, tracked
+  over a rolling window (`ProsodyTracker`) to expose energy/pitch trends. Classical
+  DSP, not a trained model, but genuinely tested against synthetic audio (numpy is
+  actually installed in this environment, unlike torch) rather than written blind —
+  a 150Hz sine wave is detected as 150Hz, silence and white noise correctly return
+  `None` rather than a meaningless number, and a declining-amplitude tone sequence is
+  correctly detected as "trailing off." Fed frame-by-frame from the same raw PCM
+  `_recv_loop` already decodes (before the torch conversion), so no new audio path
+  was needed. `InterruptionClassifier.classify` now accepts an optional
+  `energy_trend` and uses it as a one-way override: real acoustic evidence of
+  declining energy downgrades a lexical/VAD barge-in call to hesitation (someone
+  trailing off, not committing), but never the reverse — word count and VAD can
+  suggest an attempt to interject; declining energy is direct evidence they didn't
+  follow through on it.
 
-25 new unit tests, all torch-free (145/145 total across `test_cognitive.py` +
-`test_memory.py` + `test_interruption.py`). One real classifier bug caught during
-testing: the initial version defaulted every non-barge-in, non-backchannel overlap
-to `HESITATION`, which would have mislabeled a substantive multi-word utterance
-whose VAD signal simply hadn't confirmed "sustained" yet — fixed to fall through to
+47 new unit tests, all torch-free (171/171 total across `test_cognitive.py` +
+`test_memory.py` + `test_interruption.py` + `test_prosody.py`). Two real bugs caught
+during testing this round: the classifier one below, and a `RuntimeWarning` in
+`estimate_pitch` from calling `.mean()` on a possibly-empty array before checking its
+size — reordered the check, now silent and correct on the empty/too-short input case.
+One real classifier bug caught during testing: the initial version defaulted every
+non-barge-in, non-backchannel overlap to `HESITATION`, which would have mislabeled a
+substantive multi-word utterance whose VAD signal simply hadn't confirmed "sustained"
+yet — fixed to fall through to
 `NONE` in that ambiguous case, with a regression test for the distinction.
 
 ---
 
 ## Phase 5 — 🟠 Prosody, emotion, conversational behavior
 
-| # | Task |
-|---|---|
-| 5.1 | Extract prosodic features already implicit in Mimi's audio tokens/VAD signal (pitch trend, rate, pause structure) into `ConversationState.user_emotion` |
-| 5.2 | Feed emotion/uncertainty signal into the retrieval urgency classifier (Phase 2.2) and the conditioning-strength function (Phase 1.1) — e.g. a hesitant question gets more cautious grounding |
+| # | Task | Status |
+|---|---|---|
+| 5.1 | Extract prosodic features already implicit in Mimi's audio tokens/VAD signal (pitch trend, rate, pause structure) into `ConversationState.user_emotion` | ✅🧪 partial (see Phase 4 status) |
+| 5.2 | Feed emotion/uncertainty signal into the retrieval urgency classifier (Phase 2.2) and the conditioning-strength function (Phase 1.1) — e.g. a hesitant question gets more cautious grounding | 🔲 |
 
 **Acceptance:** feature extraction testable against recorded audio fixtures once
 available; full loop is BLOCKED without GPU + real audio.
+
+**5.1 status:** pulled forward and implemented alongside Phase 4 — `cognitive/prosody.py`
+(`ProsodyTracker`, `estimate_pitch`, `rms_energy`) extracts real pitch/energy from raw
+PCM and is already consumed by the Phase 4.2 interruption classifier. Genuinely
+tested against synthetic audio (ground-truth sine waves), not audio fixtures, since
+none exist in this repo yet — see the Phase 4 status block above for detail. Not yet
+feeding `ConversationState.user_emotion` (no such field exists — Phase 4.1 only
+formalized `user_confidence`, which the classifier does update) or a real emotion
+model; that's still 5.2-adjacent future work, tracked separately below.
+
+**5.2 status:** not started. The natural next step for this signal: thread
+`ProsodyTracker.energy_trend()`/`pitch_trend()` into `classify_urgency` (Phase 2.2)
+and `ConfidenceScore` (Phase 1.1) the same way it's now used in the interruption
+classifier — e.g. a hesitant, declining-energy question could get a lower-confidence
+grounding pass, exactly as PHASES.md originally sketched.
 
 ---
 

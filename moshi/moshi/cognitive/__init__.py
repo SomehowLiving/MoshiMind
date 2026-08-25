@@ -33,6 +33,7 @@ from .conversation_state import (
     decide_interruption_response,
 )
 from .interruption import InterruptionClassifier
+from .prosody import ProsodyFeatures, ProsodyTracker, estimate_pitch, rms_energy
 
 __all__ = [
     "ConfidenceScore",
@@ -69,4 +70,8 @@ __all__ = [
     "ConversationState",
     "decide_interruption_response",
     "InterruptionClassifier",
+    "ProsodyFeatures",
+    "ProsodyTracker",
+    "estimate_pitch",
+    "rms_energy",
 ]

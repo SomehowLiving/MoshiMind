@@ -226,6 +226,35 @@ def test_classifier_respects_custom_vad_threshold():
     assert clf.classify("please stop now", vad_history=vad_sequence, vad_threshold=0.5) == InterruptionKind.BARGE_IN
 
 
+def test_classifier_declining_energy_downgrades_barge_in_to_hesitation():
+    """Word count + VAD alone would call this a barge-in, but real acoustic evidence
+    (declining energy -- the user is trailing off, not committing) overrides it."""
+    clf = InterruptionClassifier(min_barge_in_words=4, sustained_voice_frames=3)
+    vad_sequence = [0.2, 0.15, 0.1]
+    result = clf.classify("wait no that's not right", vad_history=vad_sequence, energy_trend=-0.05)
+    assert result == InterruptionKind.HESITATION
+
+
+def test_classifier_rising_energy_does_not_prevent_barge_in():
+    clf = InterruptionClassifier(min_barge_in_words=4, sustained_voice_frames=3)
+    vad_sequence = [0.2, 0.15, 0.1]
+    result = clf.classify("wait no that's not right", vad_history=vad_sequence, energy_trend=0.05)
+    assert result == InterruptionKind.BARGE_IN
+
+
+def test_classifier_energy_trend_none_behaves_like_no_acoustic_signal():
+    clf = InterruptionClassifier(min_barge_in_words=4, sustained_voice_frames=3)
+    vad_sequence = [0.2, 0.15, 0.1]
+    result = clf.classify("wait no that's not right", vad_history=vad_sequence, energy_trend=None)
+    assert result == InterruptionKind.BARGE_IN
+
+
+def test_classifier_energy_trend_does_not_affect_backchannel_classification():
+    clf = InterruptionClassifier()
+    # Even with declining energy, a clear backchannel phrase is still a backchannel.
+    assert clf.classify("mhm", vad_history=[0.6], energy_trend=-0.5) == InterruptionKind.BACKCHANNEL
+
+
 def test_classifier_full_conversation_style_sequence():
     """A recorded-style event sequence: backchannel, then a hesitation, then a real
     barge-in -- exercising the classifier the way it would actually be called, once
