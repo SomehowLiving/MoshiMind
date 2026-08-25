@@ -39,6 +39,13 @@ from aiohttp import web
 from .audio_processor import AudioProcessor
 from .rag_manager import RAGManager
 from ..cognitive.confidence import ConfidenceScore
+from ..cognitive.conversation_state import (
+    ConversationState,
+    InterruptionDecision,
+    InterruptionKind,
+    decide_interruption_response,
+)
+from ..cognitive.interruption import InterruptionClassifier
 from ..cognitive.merge import KnowledgeCandidate, resolve_reference_conditioning
 from ..cognitive.memory import extract_facts, score_salience
 from ..cognitive.multishot import MultiShotGate
@@ -146,6 +153,15 @@ class Channel:
             max_shots_per_turn=server.rag_max_shots_per_turn,
             min_cooldown_seconds=server.rag_shot_cooldown_seconds,
         )
+        # Full-duplex interruption tracking (PHASES.md Phase 4.1/4.2). Detection and
+        # state-tracking only for now: actually cutting Moshi's in-flight audio
+        # generation on a barge-in (Phase 4.3) needs a hook into the batched step
+        # loop (BatchRunner/LMGen), which is GPU-only to build and verify safely --
+        # not attempted in this environment. This wiring computes and surfaces the
+        # classification/decision so that hook has something real to act on.
+        self.conversation_state = ConversationState()
+        self.interruption_classifier = InterruptionClassifier()
+        self._overlap_utterance: str = ""
 
     async def __aenter__(self) -> "Channel":
         self._stack = contextlib.AsyncExitStack()
@@ -490,7 +506,31 @@ class Channel:
                     self._turn_index += 1
                     self.predictive_trigger.reset()
                     self.rag_manager.clear_speculative()
+                    self._overlap_utterance = ""
+                    self.conversation_state.begin_user_turn()
                 await self._send_turn_outputs(outputs)
+
+                if self.turn_manager.active_speaker == "model":
+                    # STT recognized words while TurnManager still considers the model
+                    # active -- genuine full-duplex overlap (PHASES.md Phase 4.2).
+                    self._overlap_utterance += msg.text
+                    kind = self.interruption_classifier.classify(
+                        self._overlap_utterance, self.turn_manager.vad_history, self.turn_manager.threshold
+                    )
+                    if kind is not InterruptionKind.NONE:
+                        self.conversation_state.note_overlap(kind)
+                        decision = decide_interruption_response(self.conversation_state, kind)
+                        self._log.info(
+                            f"[Interruption] classified={kind.value} decision={decision.value} "
+                            f"overlap='{self._overlap_utterance.strip()}'"
+                        )
+                        self.server.metrics.increment(f"interruption_{kind.value}_total")
+                        if decision is InterruptionDecision.YIELD:
+                            # Detected and logged, not yet acted on: cutting live audio
+                            # generation needs a hook into the batched step loop
+                            # (BatchRunner/LMGen) that this environment can't safely
+                            # build or verify without a GPU -- see PHASES.md Phase 4.3.
+                            self.server.metrics.increment("interruption_barge_in_not_acted_total")
 
                 if self.turn_manager.active_speaker == "user":
                     self._current_user_utterance += msg.text
@@ -554,6 +594,8 @@ class Channel:
                     # to memory before it's cleared for the next user turn.
                     self.multishot_gate.reset()
                     self._commit_user_utterance_to_memory()
+                    self._overlap_utterance = ""
+                    self.conversation_state.begin_model_turn()
                 await self._send_turn_outputs(outputs)
 
             self.rag_manager.step()

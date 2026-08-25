@@ -25,6 +25,14 @@ from .rag_service import RAGCognitiveService
 from .tools.calculator import CalculatorService, evaluate_arithmetic, UnsafeExpressionError
 from .merge import KnowledgeCandidate, merge_candidates, resolve_reference_conditioning
 from .memory import MemoryStore, EpisodicRecord, SemanticFact, WorkingMemory, score_salience, extract_facts, MemoryCognitiveService
+from .conversation_state import (
+    SpeakingState,
+    InterruptionKind,
+    InterruptionDecision,
+    ConversationState,
+    decide_interruption_response,
+)
+from .interruption import InterruptionClassifier
 
 __all__ = [
     "ConfidenceScore",
@@ -55,4 +63,10 @@ __all__ = [
     "score_salience",
     "extract_facts",
     "MemoryCognitiveService",
+    "SpeakingState",
+    "InterruptionKind",
+    "InterruptionDecision",
+    "ConversationState",
+    "decide_interruption_response",
+    "InterruptionClassifier",
 ]

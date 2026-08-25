@@ -293,15 +293,61 @@ This is the one area where the plan explicitly says *don't* let infrastructure
 for transport; conversational-state decisions (is this a real interruption, is the
 user hesitating, should Moshi yield) belong in the Moshi-facing layer.
 
-| # | Task |
-|---|---|
-| 4.1 | Formalize `ConversationState` (turn_id, speaking_state, interruption_state, user_confidence) referenced by later phases — currently implicit across `turn_manager.py`/`channel.py` |
-| 4.2 | Interruption classifier: barge-in vs. backchannel ("mhm", "right") vs. hesitation, from VAD + partial ASR words already available in `turn_manager.py` |
-| 4.3 | Mid-generation response change: when a real interruption is detected, cut generation and re-condition rather than finish-then-listen |
+| # | Task | Status |
+|---|---|---|
+| 4.1 | Formalize `ConversationState` (turn_id, speaking_state, interruption_state, user_confidence) referenced by later phases — currently implicit across `turn_manager.py`/`channel.py` | ✅🧪 |
+| 4.2 | Interruption classifier: barge-in vs. backchannel ("mhm", "right") vs. hesitation, from VAD + partial ASR words already available in `turn_manager.py` | ✅🧪 |
+| 4.3 | Mid-generation response change: when a real interruption is detected, cut generation and re-condition rather than finish-then-listen | 🔲 BLOCKED |
 
 **Acceptance:** 4.1/4.2 are pure state-machine logic, testable against recorded
 VAD/ASR event sequences without audio hardware. 4.3 requires the live generation loop
 — BLOCKED here, GPU-only.
+
+**Status:** 4.1/4.2 implemented, tested, *and* live-wired into `channel.py` — this
+phase does not follow the "prove it, wire it later" pattern used for RAG/memory
+because the wiring here is pure bookkeeping/observability, not a change to what
+Moshi generates, so there was no reason to hold it back.
+
+- **4.1** `cognitive/conversation_state.py::ConversationState` — `turn_id`,
+  `speaking_state` (`IDLE`/`USER_SPEAKING`/`MODEL_SPEAKING`/`OVERLAPPING`),
+  `interruption_state`, `user_confidence`. `OVERLAPPING` is the state
+  `TurnManager.active_speaker` (a single string) structurally cannot represent —
+  the entire point of tracking this separately: a half-duplex turn-taking model has
+  no way to say "both are talking right now," which is exactly the full-duplex case
+  this phase cares about. A separate `decide_interruption_response(state, kind)`
+  policy function maps a classification to `CONTINUE`/`YIELD`/`WAIT`.
+- **4.2** `cognitive/interruption.py::InterruptionClassifier` — heuristic, same
+  placeholder posture as `PredictiveTrigger`: real barge-in detection wants prosody
+  (Phase 5) and semantic judgment of the partial words, neither of which exists yet.
+  Uses only what's already available: VAD history (matching `TurnManager`'s own
+  convention — lower value means voice present) and the partial ASR transcript.
+  Backchannel = short exact-phrase match ("mhm", "right", ≤2 words); barge-in =
+  sustained low-VAD frames *and* enough words to be substantive; hesitation = a
+  trailing filler word, or a short utterance without confirmed sustained voice;
+  otherwise `NONE` (ambiguous, insufficient signal — deliberately not defaulted to
+  hesitation, since a real multi-word utterance whose VAD just hasn't caught up yet
+  shouldn't be mislabeled). Tested against recorded-style VAD/ASR event sequences,
+  including one exercising backchannel → hesitation → barge-in as a single session
+  the way the classifier is actually called, once per incoming partial transcript.
+- **Live-wired**: `Channel` now owns a `ConversationState` and `InterruptionClassifier`.
+  `begin_user_turn()`/`begin_model_turn()` fire at the same turn-transition points
+  already used for the Phase 1.2/1.3/3 resets. When `STTWordMessage`s keep arriving
+  while `TurnManager.active_speaker` still says `"model"` — literal full-duplex
+  overlap — the classifier runs, `ConversationState.note_overlap` updates, the
+  decision is logged, and `interruption_{kind}_total` metrics are incremented.
+- **4.3 explicitly not implemented, not just "not tested"**: a `YIELD` decision is
+  detected, logged, and counted (`interruption_barge_in_not_acted_total`) but the
+  model keeps talking regardless — actually cutting generation needs a hook into the
+  batched step loop (`BatchRunner`/`LMGen`), GPU-only to build and verify safely, and
+  risky to guess at blind. Better to surface a real, correct decision that isn't
+  acted on yet than to guess at step-loop surgery with no way to test it.
+
+25 new unit tests, all torch-free (145/145 total across `test_cognitive.py` +
+`test_memory.py` + `test_interruption.py`). One real classifier bug caught during
+testing: the initial version defaulted every non-barge-in, non-backchannel overlap
+to `HESITATION`, which would have mislabeled a substantive multi-word utterance
+whose VAD signal simply hadn't confirmed "sustained" yet — fixed to fall through to
+`NONE` in that ambiguous case, with a regression test for the distinction.
 
 ---
 
