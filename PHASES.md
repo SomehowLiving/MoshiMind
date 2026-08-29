@@ -623,6 +623,32 @@ stream mid-response to trigger). Natural next steps if resuming this line of wor
 not urgent — the core, highest-priority mechanism (Phase 1's RAG conditioning loop)
 is now proven live end-to-end.
 
+### Per-connection setup latency fixed: build the STT model once, not per connection
+
+The ~40-90s-per-connection setup cost (from quantizing an entire separate ~1B
+checkpoint on every single WebSocket connection, see above) was fully avoidable: the
+weights don't change between connections, only the streaming state needs to be
+private per connection. Extended the same pattern the codebase already uses for
+Mimi (`ServerState.mimi_copy = deepcopy(mimi)`, built once at startup) to the STT
+model:
+
+- `moshi/moshi/stt/local_stt.py::build_stt_lm` factors the expensive part (HF checkpoint
+  load + int8 quantization) out of `LocalSpeechToText.__init__` into a standalone
+  function; `LocalSpeechToText` now accepts an optional pre-built `lm=`, skipping that
+  work entirely when one is supplied.
+- `ServerState.__init__` calls `build_stt_lm(...)` once at server startup and stores
+  the result as `self.stt_lm_template` (skipped when `gradium_stt` is set, since that
+  path doesn't use `LocalSpeechToText` at all).
+- `Channel.__init__` now passes `lm=deepcopy(server.stt_lm_template)` — a cheap copy
+  of an already-quantized, already-loaded model — instead of rebuilding from scratch.
+
+**Verified**: per-connection setup dropped from 40-93s to a consistent **~3 seconds**
+across repeated connect/disconnect cycles, with GPU memory completely stable (no
+leak). Startup itself is correspondingly slower by the STT quantization time (~41s
+for the ~1B STT model, vs. ~4 minutes for the main 7B model) — a one-time cost paid
+once per server launch instead of once per connection, which is exactly the tradeoff
+wanted.
+
 ---
 
 ## Implementation log

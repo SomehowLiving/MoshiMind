@@ -31,6 +31,7 @@ from .inference_utils.retrieval_profiles import default_profile_id, load_retriev
 from .cognitive.telemetry import RetrievalTelemetry
 from .cognitive.sidecar import CognitiveSidecar
 from .cognitive.memory import MemoryStore, MemoryCognitiveService
+from .stt.local_stt import build_stt_lm
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,16 @@ class ServerState:
         self.stt_wait_steps = int(stt_wait_time * mimi.frame_rate) if stt_wait_time > 0 else 0
         self.gradium_stt = gradium_stt
         self.mimi_copy = deepcopy(mimi)
+
+        # Built once here rather than per connection: LocalSpeechToText otherwise
+        # loads and (when quantizing) int8-converts an entire separate ~1B-parameter
+        # checkpoint from scratch on every single new WebSocket connection, which is
+        # the dominant cost in per-connection setup latency. Channel.__init__ deepcopies
+        # this already-built template per connection instead — cheap, since it skips
+        # both the HF checkpoint load and the quantization pass.
+        self.stt_lm_template = None if gradium_stt else build_stt_lm(
+            device=device or "cpu", dtype=torch.bfloat16, quantize_8bit=quantize_8bit
+        )
 
         mimi.set_num_codebooks(lm_gen.lm_model.num_codebooks - 1)
 

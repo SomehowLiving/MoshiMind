@@ -11,7 +11,7 @@ from typing import AsyncIterator, Callable
 import numpy as np
 import torch
 
-from ..models import LMGen, MimiModel, loaders
+from ..models import LMGen, LMModel, MimiModel, loaders
 from .stt import STTMarkerMessage, STTWordMessage
 
 
@@ -20,6 +20,27 @@ logger = getLogger(__name__)
 # Match ``stt.py`` / Gradium: ignore unstable VAD for the first few steps after audio starts.
 _VAD_SKIP_STEPS = 12
 
+DEFAULT_STT_HF_REPO = "kyutai/stt-1b-en_fr-candle"
+
+
+def build_stt_lm(
+    hf_repo: str = DEFAULT_STT_HF_REPO,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+    quantize_8bit: bool = False,
+) -> LMModel:
+    """Build (and, if requested, int8-quantize) the STT LM once.
+
+    This is the expensive part of ``LocalSpeechToText`` construction (loading a
+    separate ~1B-parameter checkpoint from HF and, when quantizing, converting every
+    Linear layer one at a time). Callers that serve more than one connection should
+    call this once (e.g. at server startup) and pass the result as ``lm=`` to
+    ``LocalSpeechToText``, using ``copy.deepcopy`` per connection instead of rebuilding
+    from scratch — the same pattern already used for the shared Mimi model.
+    """
+    checkpoint_info = loaders.CheckpointInfo.from_hf_repo(hf_repo)
+    return checkpoint_info.get_moshi(device=device, dtype=dtype, quantize_8bit=quantize_8bit)
+
 
 class LocalSpeechToText:
     """Wrapper for local STT using the same Mimi + LMGen stack based on repo kyutai/stt-1b-en_fr-candle"""
@@ -27,11 +48,12 @@ class LocalSpeechToText:
     def __init__(
         self,
         mimi: MimiModel,
-        hf_repo: str = "kyutai/stt-1b-en_fr-candle",
+        hf_repo: str = DEFAULT_STT_HF_REPO,
         device: str | torch.device | None = None,
         vad_callback: Callable[[float], None] | None = None,
         dtype: torch.dtype = torch.bfloat16,
         quantize_8bit: bool = False,
+        lm: LMModel | None = None,
     ) -> None:
         self.vad_callback = vad_callback
 
@@ -46,7 +68,8 @@ class LocalSpeechToText:
         # Set up STT models and mimi
         checkpoint_info = loaders.CheckpointInfo.from_hf_repo(hf_repo)
         self.text_tokenizer = checkpoint_info.get_text_tokenizer()
-        lm = checkpoint_info.get_moshi(device=self._device, dtype=dtype, quantize_8bit=quantize_8bit)
+        if lm is None:
+            lm = checkpoint_info.get_moshi(device=self._device, dtype=dtype, quantize_8bit=quantize_8bit)
         self._lm_gen = LMGen(lm, cfg_coef=1.0, **checkpoint_info.lm_gen_config)
         self._prime_cap = max(self._lm_gen.lm_model.delays)
 

@@ -23,6 +23,7 @@ Use as an async context manager:
 
 import asyncio
 import contextlib
+from copy import deepcopy
 import json
 import logging
 import time
@@ -122,10 +123,15 @@ class Channel:
             )
         else:
             assert mimi is not None
+            stt_lm_template = getattr(server, "stt_lm_template", None)
             self.stt = LocalSpeechToText(
                 mimi=mimi,
                 vad_callback=self.turn_manager.update_vad,
                 quantize_8bit=getattr(server, "quantize_8bit", False),
+                # Deepcopy a pre-built (and already quantized, if applicable) template
+                # instead of loading + quantizing a fresh ~1B-parameter checkpoint on
+                # every connection -- see ServerState.stt_lm_template.
+                lm=deepcopy(stt_lm_template) if stt_lm_template is not None else None,
             )
 
         # Communication with the batched step loop.
