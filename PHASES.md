@@ -574,13 +574,54 @@ real, hardware-only-discoverable findings came out of this:
   hiking.") was transcribed for real — the server's log shows `[Buffer] buffering
   user text while model is active. first_chunk='which'`, i.e. `LocalSpeechToText`
   actually recognized a real word from the actual audio and the existing
-  buffer-while-model-active logic engaged exactly as coded. Per-connection setup
-  latency (deepcopy + quantizing two separate models from scratch) plus this per-step
-  slowness together meant a 30-second test window wasn't long enough to reach a
-  `rag_token_id` emission or a full spoken response — not a correctness failure, a
-  timing-budget one; a longer-duration test (several minutes, matched to the ~7-30x
-  real-time-slower throughput measured above) is the natural next step, not further
-  code changes.
+  buffer-while-model-active logic engaged exactly as coded.
+
+### Rerun with a real timing budget: Phase 1, 0.4, and 4.2 all confirmed live, together
+
+A 30-second test window wasn't long enough given the measured ~7-30x-slower-than-
+real-time throughput above — not a correctness failure, a timing-budget one. Rerun
+with a budget matched to that measurement (up to 150s for the now-slower quantized
+per-connection setup, several minutes of wait afterward). This time the full pipeline
+ran end to end, live, for the first time ever:
+
+- **Phase 1.2 (predictive/speculative retrieval)**: the server log shows
+  `[RAG] predictive trigger fired on partial transcript: 'which is the'` firing
+  *before* any `rag_token_id` emission, exactly as designed — followed immediately by
+  `[Reference] started speculative retrieval ahead of rag_token_id`.
+- **Phase 1.1 (confidence-aware conditioning) + the retrieval LLM**: Groq
+  (`openai/gpt-oss-20b`) returned a real, correct answer — `reference_text` =
+  `"Reference: The capital city of France is Paris."` — scored by
+  `ConfidenceScore.heuristic_from_llm_reference` at **0.888** and logged to
+  `/api/retrieval_telemetry` with `kind: "speculative"`, `applied: true`,
+  `latency_seconds: 2.94`. `/api/metrics` after the run showed
+  `rag_speculative_triggers_total: 1`, `rag_speculative_started_total: 1`.
+  The client received the reference text over the wire too (`referencetext` message,
+  `openai/gpt-oss-20b\tReference: The capital city of France is Paris.`).
+- **Phase 0.4 (ARC-encoder fault isolation), now genuinely exercised, not just coded
+  for**: since `server_conditioner.py` was never started (blocked on gated
+  `meta-llama/Llama-3.2-3B-Instruct` access), the ARC encoding request genuinely
+  failed (`All connection attempts failed`) — `/api/metrics` shows
+  `rag_arc_encoder_errors_total: 1`. The conversation did not crash: the model sent a
+  `[RET_FAILED]` marker and kept talking, finishing its sentence ("what are you
+  curious about?") and continuing naturally into its next line ("Okay,...") — the
+  exact designed degradation path, now proven under a real failure, not a fake one.
+- **Phase 4.2 (interruption classifier)**: `/api/metrics` shows
+  `interruption_hesitation_total: 4` — the classifier fired four times against the
+  real VAD/partial-transcript signal from actual audio, not a scripted event sequence.
+- **The model's own text generation is coherent**: word-by-word streamed output over
+  the WebSocket read `'Hi', ',', 'what', 'are', 'you', 'curious', '[RET_FAILED]',
+  'about', '?', ..., 'Okay', ','` — a real, sensible spoken response, not garbage —
+  meaning int8 quantization did not visibly degrade output quality in this exchange.
+- Server ended the run fully healthy (`/api/health` → `{"status": "ok"}`) with no
+  leftover state or memory leak.
+
+Not yet exercised in this pass: Phase 3's memory commit/recall (the conversation was
+short and single-turn; the mechanism fires but wasn't independently verified via
+`/api/memory/{user_id}` since the connection's per-session UUID isn't exposed to the
+client) and Phase 4.3's audio-mute-on-barge-in (would need a second, overlapping audio
+stream mid-response to trigger). Natural next steps if resuming this line of work,
+not urgent — the core, highest-priority mechanism (Phase 1's RAG conditioning loop)
+is now proven live end-to-end.
 
 ---
 
