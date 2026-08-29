@@ -122,7 +122,11 @@ class Channel:
             )
         else:
             assert mimi is not None
-            self.stt = LocalSpeechToText(mimi=mimi, vad_callback=self.turn_manager.update_vad)
+            self.stt = LocalSpeechToText(
+                mimi=mimi,
+                vad_callback=self.turn_manager.update_vad,
+                quantize_8bit=getattr(server, "quantize_8bit", False),
+            )
 
         # Communication with the batched step loop.
         self.input_queue: asyncio.Queue[StepInput] = asyncio.Queue()

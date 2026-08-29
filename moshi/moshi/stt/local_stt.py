@@ -31,6 +31,7 @@ class LocalSpeechToText:
         device: str | torch.device | None = None,
         vad_callback: Callable[[float], None] | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        quantize_8bit: bool = False,
     ) -> None:
         self.vad_callback = vad_callback
 
@@ -45,7 +46,7 @@ class LocalSpeechToText:
         # Set up STT models and mimi
         checkpoint_info = loaders.CheckpointInfo.from_hf_repo(hf_repo)
         self.text_tokenizer = checkpoint_info.get_text_tokenizer()
-        lm = checkpoint_info.get_moshi(device=self._device, dtype=dtype)
+        lm = checkpoint_info.get_moshi(device=self._device, dtype=dtype, quantize_8bit=quantize_8bit)
         self._lm_gen = LMGen(lm, cfg_coef=1.0, **checkpoint_info.lm_gen_config)
         self._prime_cap = max(self._lm_gen.lm_model.delays)
 

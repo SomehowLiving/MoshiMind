@@ -536,6 +536,52 @@ Server confirmed healthy end-to-end: boots, loads the quantized model, warms up,
 accepts a real WebSocket client, and stays responsive to other clients throughout —
 all genuinely executed for the first time, not reasoned through against fakes.
 
+### Real audio, sent over the WebSocket: STT pipeline genuinely works, throughput doesn't
+
+Sent real synthesized speech (gTTS, ffmpeg-resampled to 24kHz, opus-encoded with
+`sphn.OpusStreamWriter` — the same encoder the server itself uses — and framed with
+the `0x01` kind byte per `channel.py`'s wire protocol) to a live connection. Two more
+real, hardware-only-discoverable findings came out of this:
+
+- **A second OOM, fixed the same way as the first**: `LocalSpeechToText.__init__`
+  (`moshi/moshi/stt/local_stt.py`) builds an entirely separate **~1B-parameter STT
+  checkpoint from scratch on every connection** — on top of the main quantized LM,
+  this pushed real generation past the ~330MB of headroom left after loading the main
+  model, causing a genuine `torch.OutOfMemoryError` the moment a client tried to
+  actually converse (not merely connect). Fixed the same way as the main LM: threaded
+  `quantize_8bit` through `LocalSpeechToText.__init__` → `CheckpointInfo.get_moshi` (a
+  new `ServerState.quantize_8bit` attribute, set from `--quantize-8bit`, passed down
+  through `Channel.__init__`). Verified: with both models quantized, a full send of 7s
+  of real speech no longer OOMs.
+- **The shared batched step loop does not yield during its own compute** — a bigger,
+  different problem than the earlier connection-setup lockup. `ServerState.run_one_step`
+  calls `self.runner.run_step(...)` as a plain synchronous (non-`await`ed) call; the
+  `_step_loop` only yields via a bare `asyncio.sleep(0)` *between* steps. On this
+  quantized model each step reliably takes 570ms–2.5s (there's already a
+  `batched step (.../... active) took Xms` warning that logs this) — against an ~80ms
+  real-time frame budget, meaning the model runs roughly **7–30x slower than
+  real-time** on this hardware once quantized. During that multi-hundred-ms-to-second
+  window the event loop effectively starves everything else, including `/api/health`
+  from a *different* connection, which timed out repeatedly while GPU utilization sat
+  at 76–97%. Confirmed via direct polling that this is real starvation, not a
+  deadlock — health checks eventually go through once a gap between steps lines up.
+  **This is precisely the remaining half of Phase 4.3** that `RECAP.md`/this file
+  already flagged as needing a GPU to attempt safely (hooking the shared
+  `BatchRunner`/`LMGen` step loop) — now with concrete, measured evidence of the
+  problem such a fix would need to solve, rather than a hypothesis.
+- **The STT pipeline genuinely works**: despite the throughput problem, real spoken
+  audio (gTTS saying "What is the capital of France? ... my name is Alex and I like
+  hiking.") was transcribed for real — the server's log shows `[Buffer] buffering
+  user text while model is active. first_chunk='which'`, i.e. `LocalSpeechToText`
+  actually recognized a real word from the actual audio and the existing
+  buffer-while-model-active logic engaged exactly as coded. Per-connection setup
+  latency (deepcopy + quantizing two separate models from scratch) plus this per-step
+  slowness together meant a 30-second test window wasn't long enough to reach a
+  `rag_token_id` emission or a full spoken response — not a correctness failure, a
+  timing-budget one; a longer-duration test (several minutes, matched to the ~7-30x
+  real-time-slower throughput measured above) is the natural next step, not further
+  code changes.
+
 ---
 
 ## Implementation log

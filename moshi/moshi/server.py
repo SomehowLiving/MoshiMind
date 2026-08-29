@@ -121,8 +121,14 @@ class ServerState:
         memory_db_path: str = ":memory:",
         memory_lookup_deadline: float = 0.2,
         memory_salience_threshold: float = 0.5,
+        quantize_8bit: bool = False,
     ):
         self.text_tokenizer = text_tokenizer
+        # Threaded through to LocalSpeechToText's own model construction (Channel.__init__):
+        # the STT path builds an entirely separate ~1B-parameter checkpoint per connection,
+        # which needs the same int8 quantization as the main LM to fit alongside it on a
+        # memory-constrained GPU.
+        self.quantize_8bit = quantize_8bit
         self.reference_encoder_url = reference_encoder_url
         self.rag_timeout = rag_timeout
         self.rag_min_conditioning_strength = rag_min_conditioning_strength
@@ -517,6 +523,7 @@ def main():
         vad_threshold=args.vad_threshold,
         init_active_speaker=args.init_active_speaker,
         power_threshold=args.power_threshold,
+        quantize_8bit=args.quantize_8bit,
     )
     logger.info("warming up the model")
     state.warmup()
