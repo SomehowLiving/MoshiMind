@@ -94,7 +94,13 @@ class LLMReferenceGenerator:
         self._warmup_all_retrieval_llms()
 
     def _warmup_all_retrieval_llms(self) -> None:
-        """Call ``warmup()`` on each retrieval ``LLMClient`` (separate endpoints). Single env LLM path warms ``self.llm`` only."""
+        """Call ``warmup()`` on each retrieval ``LLMClient`` (separate endpoints). Single env LLM path warms ``self.llm`` only.
+
+        A warmup failure (bad key, exhausted quota, unreachable endpoint) is logged and
+        swallowed rather than raised: it should degrade the retrieval LLM path the same
+        way an ARC-encoder failure already does (see channel.py fault isolation), not
+        crash server startup and take every RAG-independent feature down with it.
+        """
         if self._llm_by_id:
             for profile_id, llm in self._llm_by_id.items():
                 logger.info(
@@ -102,9 +108,22 @@ class LLMReferenceGenerator:
                     profile_id,
                     getattr(llm, "model_name", "?"),
                 )
-                llm.warmup()
+                try:
+                    llm.warmup()
+                except Exception:
+                    logger.exception(
+                        "[Reference] Warmup failed for retrieval profile id=%r; "
+                        "will retry at request time. Continuing startup.",
+                        profile_id,
+                    )
         else:
-            self.llm.warmup()
+            try:
+                self.llm.warmup()
+            except Exception:
+                logger.exception(
+                    "[Reference] Warmup failed for the retrieval LLM; will retry at request "
+                    "time. Continuing startup."
+                )
 
     def reference_model_display_name(self, active_profile_id: str | None = None) -> str:
         """Model name for the given (or default) retrieval profile."""

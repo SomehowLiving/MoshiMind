@@ -458,6 +458,86 @@ Only touched if it's blocking a higher-priority phase.
 
 ---
 
+## Live validation session (GPU hardware, first real execution)
+
+Everything in this section happened on a machine with a real GPU (RTX 5050 Laptop,
+8GB VRAM, Blackwell/sm_120) — the first time any of this repo's torch-dependent code
+has actually been executed, as opposed to reasoned through and unit-tested against
+fakes. See `RECAP.md` for the full handoff context this picked up from.
+
+**Environment bugs found only by executing the code (not visible from reading it):**
+- `moshi/pyproject.toml` had `readme = "../README.md"`, which a modern `hatchling`
+  rejects (readme must be inside the project directory) — `pip install -e moshi/`
+  failed metadata generation before installing anything. Fixed by adding
+  `moshi/README.md` (copy of the root one) and pointing `readme` at it.
+- `websockets` is imported directly in `channel.py` but was in neither
+  `pyproject.toml` nor `requirements.txt` — added to both (`>=13.0,<16.0`), the same
+  drift class the prior session's audit had already fixed once for other packages.
+
+**8GB VRAM doesn't fit the real checkpoint — quantization wired in:** the real
+`kyutai/moshika-rag-pytorch-bf16` checkpoint is ~7B params / ~15GB in bf16, which does
+not fit an 8GB card. The codebase already had a dormant, correct-but-unwired
+int8 quantization utility (`moshi/moshi/utils/quantize.py::QLinear`/
+`replace_linear_with_qlinear`, bitsandbytes-based) that nothing called. Wired it into
+`moshi/moshi/models/loaders.py::get_moshi_lm` behind a new `--quantize-8bit` CLI flag
+(`server.py`): the state dict is staged on CPU (not the GPU) when quantizing, then
+every `nn.Linear` is converted to int8 one layer at a time — moved to the target
+device, quantized, replaced — so peak memory never holds the full float model on the
+GPU at once. **Verified working**: the full stack (Mimi + quantized LM + LMGen,
+`--batch-size 1`) loads and runs in ~8.4GB, all 338 Linear layers converted, 0 left in
+float. This is the single biggest previously-BLOCKED item in this file — Phase 1/3/4's
+tensor-scaling and conditioning code has now actually executed on real hardware, not
+just against unit-test fakes.
+
+**A real, pre-existing reliability gap fixed**: `LLMReferenceGenerator.__init__`
+called `_warmup_all_retrieval_llms()` with no fault isolation — a bad API key,
+exhausted quota, or unreachable endpoint raised out of `__init__` and crashed the
+*entire server* before it could serve anything, taking every RAG-independent feature
+(memory, interruption, prosody) down with it. This is inconsistent with the project's
+own fault-isolation philosophy for the ARC-encoder path (Phase 0.4) — fixed to log and
+continue startup instead, retrying at request time.
+
+**A real, previously-undetectable concurrency bug found and fixed**: once a WebSocket
+client connected, the server appeared to hang — even a completely unrelated `GET
+/api/health` request from a different client would time out for 20+ seconds, while
+GPU utilization stayed near 0% (ruling out "just slow inference"). Root cause: `handle_chat`
+in `server.py` called `Channel(self, ws, mimi=deepcopy(self.mimi_copy))` inline,
+synchronously, inside the async handler. Two things inside that construction are slow:
+deep-copying a CUDA-resident Mimi model, and — more expensive — `Channel.__init__`
+building a `LocalSpeechToText`, which loads and constructs an entire separate
+**~1B-parameter STT checkpoint from HF, from scratch, on every single new connection**
+(`moshi/moshi/stt/local_stt.py`). Python's asyncio event loop is single-threaded, so
+this synchronous work blocked *every* connection's requests, not just the new one.
+Fixed by moving both the `deepcopy` and the full `Channel(...)` construction onto
+`loop.run_in_executor`, so the event loop stays responsive while a new connection's
+(unavoidably slow) setup happens on a worker thread. Verified: `/api/health` stayed
+fast (<0.3s) while a client was actively connecting, and 3 repeated connect/disconnect
+cycles left GPU memory completely stable (no leak from the per-connection STT model).
+
+**RAG grounding specifically is still blocked**, not by hardware but by external
+access: the reference/ARC-encoder conditioner needs `meta-llama/Llama-3.2-3B-Instruct`,
+a gated HF repo requiring the user's HF account to request and be granted access, plus
+an `HF_TOKEN`. The retrieval LLM itself (RAG's *answer-generation* step, separate from
+the ARC encoder) now runs live against Groq's OpenAI-compatible API
+(`https://api.groq.com/openai/v1`, model `openai/gpt-oss-20b`) after the original
+OpenAI key hit `insufficient_quota` — confirmed via `LLMClient`'s existing
+`LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL_NAME` env vars, no code changes needed for the
+swap itself.
+
+**Also fixed**: `moshi-server-py` (`server.py::main`) referenced `args.dtype` with no
+`--half`/`--dtype`-style flag defining it in that file (present in `run_inference.py`
+but not here) — would have crashed on the very first real run. (Turned out a `--half`
+flag already existed further down in the same file, just not matched by an initial
+grep for `dtype` in the argument name — no duplicate fix needed once found, but
+recorded here since it's exactly the kind of "only visible by reading the whole file /
+running it" issue this section is about.)
+
+Server confirmed healthy end-to-end: boots, loads the quantized model, warms up,
+accepts a real WebSocket client, and stays responsive to other clients throughout —
+all genuinely executed for the first time, not reasoned through against fakes.
+
+---
+
 ## Implementation log
 
 **This session:** Phase 0 (0.1–0.3) — `moshi/moshi/cognitive/` package: `task_registry.py`,

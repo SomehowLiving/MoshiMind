@@ -287,7 +287,19 @@ class ServerState:
 
         logger.info("new WebSocket client connected")
         try:
-            async with Channel(self, ws, mimi=deepcopy(self.mimi_copy)) as channel:
+            # Channel.__init__ does substantial synchronous, blocking setup per
+            # connection: deepcopy-ing a CUDA-resident Mimi model (tensor-by-tensor CUDA
+            # allocation/copy), and — when not using the gradium STT path — constructing
+            # a whole separate LocalSpeechToText, which itself loads and builds an
+            # entire ~1B-parameter STT checkpoint from HF. Run inline, either one blocks
+            # the single-threaded event loop for its full duration, freezing every other
+            # connection's requests (including unrelated ones like /api/health) until it
+            # finishes. Build the Channel off-thread so the loop stays responsive while
+            # this connection's (slow) one-time setup happens.
+            loop = asyncio.get_running_loop()
+            per_connection_mimi = await loop.run_in_executor(None, deepcopy, self.mimi_copy)
+            channel = await loop.run_in_executor(None, Channel, self, ws, per_connection_mimi)
+            async with channel:
                 await channel.run()
         except web.HTTPServiceUnavailable as e:
             logger.warning("Rejecting connection: %s", e.reason)
@@ -436,6 +448,12 @@ def main():
         default="model",
         choices=["model", "user"],
         help="Initial speaker used to fetch the initial condition tensors (default: model).",
+    )
+    parser.add_argument(
+        "--quantize-8bit",
+        action="store_true",
+        help="Quantize the LM's Linear layers to int8 (via bitsandbytes) while loading, "
+        "layer-by-layer, to fit the model on GPUs with limited VRAM.",
     )
     parser.add_argument(
         "--log-level",

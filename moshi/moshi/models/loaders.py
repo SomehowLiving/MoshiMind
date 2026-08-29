@@ -23,6 +23,7 @@ from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
 from ..modules.lora import replace_all_linear_with_lora, replace_lora_with_linear
+from ..utils.quantize import replace_linear_with_qlinear
 
 
 SAMPLE_RATE = 24000
@@ -409,6 +410,7 @@ def get_moshi_lm(
     lora_weights: str | Path | None = None,
     fuse_lora: bool = False,
     lm_kwargs_overrides={},
+    quantize_8bit: bool = False,
 ) -> LMModel:
     if lm_kwargs is None:
         lm_kwargs = _lm_kwargs
@@ -442,9 +444,15 @@ def get_moshi_lm(
 
     model = LMModel(device=init_device, dtype=dtype, **lm_kwargs)
 
+    # When quantizing, the state dict is staged on CPU and Linear layers are converted to
+    # int8 one at a time (see replace_linear_with_qlinear below) so peak memory never holds
+    # the full float model on the target device at once — needed to fit large checkpoints
+    # on memory-constrained GPUs.
+    load_device = "cpu" if (quantize_8bit and filename is not None) else device
+
     if filename is not None:
         if _is_safetensors(filename):
-            state = load_file(filename, device=str(device))
+            state = load_file(filename, device=str(load_device))
             for key, value in state.items():
                 if value.dtype.is_floating_point:
                     if key.startswith("condition_provider.") or key.startswith("fuser."):
@@ -453,6 +461,7 @@ def get_moshi_lm(
                         value = value.to(dtype)
                 state[key] = value
             model.load_state_dict(state, assign=True, strict=False)
+            del state
 
         else:
             pkg = torch.load(
@@ -465,6 +474,11 @@ def get_moshi_lm(
             load_weights = getattr(cond, "load_weights", None)
             if callable(load_weights):
                 load_weights()
+
+    if quantize_8bit:
+        assert not lora, "8-bit quantization and LoRA are not supported together yet."
+        replace_linear_with_qlinear(model, device=device)
+        model = model.to(device=device)
 
     if lora:
         assert not lm_kwargs.get("quantize"), "LoRA and quantization are incompatible for now."

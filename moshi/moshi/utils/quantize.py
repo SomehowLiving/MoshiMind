@@ -43,10 +43,19 @@ class QLinear(nn.Module):
         return y
 
 
-def replace_linear_with_qlinear(module):
-    """Recursively replace all Linear layers with QLinear layers."""
+def replace_linear_with_qlinear(module, device=None):
+    """Recursively replace all Linear layers with QLinear layers.
+
+    `device`: if given, each Linear's weight is moved there just before quantizing
+    (bitsandbytes' quantization kernel requires a CUDA tensor) and the resulting int8
+    weight stays there; only one layer's float weight is ever resident on `device` at
+    a time, which keeps peak memory low when converting a CPU-resident model on a
+    memory-constrained GPU instead of requiring the whole float model to fit first.
+    """
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
+            if device is not None:
+                child = child.to(device)
             setattr(module, name, QLinear(child))
         elif isinstance(child, QLinear):
             # Slight issue with the way we implement things: the scale param
@@ -57,4 +66,4 @@ def replace_linear_with_qlinear(module):
             # In any case that should happen before loading the state dict to avoid a loss of precision.
             child.float()
         else:
-            replace_linear_with_qlinear(child)
+            replace_linear_with_qlinear(child, device=device)

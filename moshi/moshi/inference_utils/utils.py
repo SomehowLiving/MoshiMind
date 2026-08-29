@@ -138,7 +138,14 @@ def load_models(args):
     logger.info("mimi loaded")
 
     logger.info(f"loading moshi on {device}")
-    lm = checkpoint_info.get_moshi(device=device, dtype=args.dtype, fuse_lora=True, skip_conditioners=skip_conditioners)
+    quantize_8bit = getattr(args, "quantize_8bit", False)
+    lm = checkpoint_info.get_moshi(
+        device=device,
+        dtype=args.dtype,
+        fuse_lora=True,
+        skip_conditioners=skip_conditioners,
+        quantize_8bit=quantize_8bit,
+    )
     logger.info("moshi loaded")
 
     logger.info("constructing moshi lm gen")

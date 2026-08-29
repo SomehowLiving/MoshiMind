@@ -13,6 +13,7 @@ sounddevice==0.5
 sphn>=0.2.0,<0.3.0
 torch>=2.2.0,<2.10
 aiohttp>=3.10.5,<3.12
+websockets>=13.0,<16.0
 tqdm>=4.48
 openai>=2.26.0
 transformers==4.55.3
